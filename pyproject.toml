@@ -40,6 +40,10 @@ dependencies = [
 test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=1.1.0",
+    # Integration tests touch kestrel_sovereign.features.training (lazy
+    # provider factory the feature uses at runtime). Pinning the
+    # framework here keeps the integration test self-contained.
+    "kestrel-sovereign>=0.5,<1",
 ]
 
 [project.urls]
