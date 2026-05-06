@@ -1,12 +1,51 @@
 [project]
 name = "kestrel-feature-visual"
 version = "0.1.0"
-description = "Kestrel visual identity feature"
-requires-python = ">=3.11"
-dependencies = [
-    "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
-    "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git",
+description = "Visual identity for Kestrel Sovereign agents — avatar generation, selfies, and LoRA training for character consistency"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "UncleSaurus" }]
+maintainers = [{ name = "UncleSaurus" }]
+keywords = [
+    "ai",
+    "agents",
+    "kestrel",
+    "image-generation",
+    "lora",
+    "replicate",
+    "avatar",
 ]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Graphics",
+]
+dependencies = [
+    "kestrel-sovereign-sdk>=0.1,<1",
+    "httpx>=0.27.0",
+    "replicate>=1.0.4",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=1.1.0",
+]
+
+[project.urls]
+Homepage = "https://kestrelsovereign.com"
+Source = "https://github.com/KestrelSovereignAI/kestrel-feature-visual"
+Issues = "https://github.com/KestrelSovereignAI/kestrel-feature-visual/issues"
 
 [project.entry-points."kestrel_sovereign.features"]
 VisualIdentityFeature = "kestrel_feature_visual:VisualIdentityFeature"
@@ -15,8 +54,8 @@ VisualIdentityFeature = "kestrel_feature_visual:VisualIdentityFeature"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.metadata]
-allow-direct-references = true
-
 [tool.hatch.build.targets.wheel]
 packages = ["kestrel_feature_visual"]
+
+[tool.hatch.build.targets.sdist]
+include = ["kestrel_feature_visual/**/*", "README.md", "LICENSE", "pyproject.toml"]
