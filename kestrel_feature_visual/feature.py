@@ -32,6 +32,7 @@ import httpx
 
 from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 from kestrel_sdk.config.constants import (
     HTTP_TIMEOUT_DEFAULT,
     TRAINING_TIMEOUT_EXTENDED,
@@ -340,7 +341,7 @@ Looking good! Want another one in a different style?"
         style: str = "photorealistic",
         allow_training: bool = True,
         provider: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Generate a selfie of the companion. REQUIRES LoRA - no censored fallback.
 
@@ -358,13 +359,16 @@ Looking good! Want another one in a different style?"
             provider: Force specific provider (runpod, vertex_ai, vastai). None = auto-select.
 
         Returns:
-            {"success": bool, "image_url": str, "scene": str, "used_lora": bool, "trained_this_request": bool, "error": str}
+            ``ToolResult.ok(confirmation, data={image_url, scene, used_lora,
+            trained_this_request, ...})`` on success;
+            ``ToolResult.failed(error, data={...})`` on failure (data may
+            include ``needs_training``, ``companion_id`` so callers can
+            decide whether to retry).
         """
         if not self.enabled:
-            return {
-                "success": False,
-                "error": "Image generation not available (no providers configured)"
-            }
+            return ToolResult.failed(
+                "Image generation not available (no providers configured)"
+            )
 
         # AUTO-FILL companion_id from agent's companion_context if not provided
         # This enables "send me a selfie" to work without the user providing IDs
@@ -463,12 +467,15 @@ Looking good! Want another one in a different style?"
                             lora_model_path = lora_model_path.replace("existing:", "")
                     else:
                         # No LoRA and not allowed to train - FAIL LOUD
-                        return {
-                            "success": False,
-                            "error": f"No LoRA model for companion {companion_id}. Train one first with /train-lora or set allow_training=true",
-                            "needs_training": True,
-                            "companion_id": companion_id
-                        }
+                        return ToolResult.failed(
+                            f"No LoRA model for companion {companion_id}. "
+                            "Train one first with /train-lora or set "
+                            "allow_training=true",
+                            data={
+                                "needs_training": True,
+                                "companion_id": companion_id,
+                            },
+                        )
 
                 # Generate with LoRA if we have a path
                 if lora_model_path:
@@ -508,25 +515,29 @@ Looking good! Want another one in a different style?"
                                 flux_version=flux_version,  # "flux1" or "flux2" for container selection
                             )
                             if result.get("success") and result.get("images"):
-                                return {
-                                    "success": True,
-                                    "image_url": result["images"][0],
-                                    "scene": scene,
-                                    "prompt": final_prompt,  # Include full prompt for gallery storage
-                                    "used_lora": True,
-                                    "trained_this_request": trained_this_request,
-                                    "reference_used": False,
-                                    "backend": result.get("backend", "provider"),
-                                    "elapsed_seconds": result.get("elapsed_seconds"),
-                                    "lora_source": "ipfs" if lora_ipfs_cid else "gcs",
-                                }
+                                return ToolResult.ok(
+                                    confirmation=(
+                                        f"Generated selfie (scene: {scene}, "
+                                        f"trained_this_request: {trained_this_request})"
+                                    ),
+                                    data={
+                                        "image_url": result["images"][0],
+                                        "scene": scene,
+                                        "prompt": final_prompt,  # for gallery storage
+                                        "used_lora": True,
+                                        "trained_this_request": trained_this_request,
+                                        "reference_used": False,
+                                        "backend": result.get("backend", "provider"),
+                                        "elapsed_seconds": result.get("elapsed_seconds"),
+                                        "lora_source": "ipfs" if lora_ipfs_cid else "gcs",
+                                    },
+                                )
                         except RuntimeError as e:
                             logger.error(f"Provider generation failed: {e}")
-                            return {
-                                "success": False,
-                                "error": f"Generation failed: {e}",
-                                "companion_id": companion_id
-                            }
+                            return ToolResult.failed(
+                                f"Generation failed: {e}",
+                                data={"companion_id": companion_id},
+                            )
 
             # =========================================================
             # NO FALLBACK - LoRA is REQUIRED for uncensored generation
@@ -534,26 +545,19 @@ Looking good! Want another one in a different style?"
             # We do NOT use Replicate's schnell - it's censored.
             # FLUX.1-dev on our own infrastructure is the only path.
             logger.error(f"No LoRA available for companion {companion_id} - cannot generate uncensored selfie")
-            return {
-                "success": False,
-                "error": "LoRA model required for selfie generation. Please train a LoRA first using /train-lora endpoint.",
-                "needs_training": True,
-                "companion_id": companion_id
-            }
+            return ToolResult.failed(
+                "LoRA model required for selfie generation. Please train "
+                "a LoRA first using /train-lora endpoint.",
+                data={"needs_training": True, "companion_id": companion_id},
+            )
 
         except RuntimeError as e:
             # RuntimeError from generate_with_lora means RunPod unavailable but LoRA exists
             logger.error(f"LoRA generation failed: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"Selfie generation error: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            return ToolResult.failed(str(e))
 
     async def _get_or_train_lora(self, companion_id: str) -> str:
         """
@@ -822,7 +826,7 @@ Looking good! Want another one in a different style?"
         self,
         companion_id: Optional[str] = None,
         image_url: Optional[str] = None
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Explicitly trigger LoRA training for a companion.
 
@@ -834,7 +838,9 @@ Looking good! Want another one in a different style?"
             image_url: Avatar image URL (auto-filled from context if not provided)
 
         Returns:
-            {"success": bool, "job_id": str, "status": str, "error": str}
+            ``ToolResult.ok(confirmation, data={status, lora_path, ...})``
+            on success (status is ``"already_trained"`` or
+            ``"completed"``). ``ToolResult.failed(error)`` otherwise.
         """
         # AUTO-FILL from agent's companion_context if not provided
         # This enables "train my LoRA" to work without the user providing IDs
@@ -850,48 +856,39 @@ Looking good! Want another one in a different style?"
                     logger.info(f"Auto-filled image_url from agent context: {image_url[:50]}...")
 
         if not companion_id:
-            return {
-                "success": False,
-                "error": "No companion_id provided and couldn't determine from context. Please specify your companion ID."
-            }
+            return ToolResult.failed(
+                "No companion_id provided and couldn't determine from "
+                "context. Please specify your companion ID."
+            )
 
         if not self._ensure_lora_services():
-            return {
-                "success": False,
-                "error": "LoRA training not available (RUNPOD_API_KEY not set)"
-            }
+            return ToolResult.failed(
+                "LoRA training not available (RUNPOD_API_KEY not set)"
+            )
 
         try:
             # Check for existing LoRA
             existing = await self._lookup_lora_path(companion_id)
             if existing:
-                return {
-                    "success": True,
-                    "status": "already_trained",
-                    "lora_path": existing
-                }
+                return ToolResult.ok(
+                    confirmation=f"LoRA for companion {companion_id} already trained",
+                    data={"status": "already_trained", "lora_path": existing},
+                )
 
             # Start training
             lora_path = await self._train_lora_for_companion(companion_id)
 
             if lora_path:
-                return {
-                    "success": True,
-                    "status": "completed",
-                    "lora_path": lora_path
-                }
+                return ToolResult.ok(
+                    confirmation=f"LoRA training completed for companion {companion_id}",
+                    data={"status": "completed", "lora_path": lora_path},
+                )
             else:
-                return {
-                    "success": False,
-                    "error": "Training failed"
-                }
+                return ToolResult.failed("Training failed")
 
         except Exception as e:
             logger.error(f"LoRA training error: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            return ToolResult.failed(str(e))
 
     @tool(
         name="generate_avatar",
@@ -903,7 +900,7 @@ Looking good! Want another one in a different style?"
         self,
         description: str,
         num_outputs: int = 2
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Generate avatar options from a description and store in Kestrel storage.
 
@@ -915,13 +912,14 @@ Looking good! Want another one in a different style?"
             num_outputs: Number of options to generate (1-4)
 
         Returns:
-            {"success": bool, "image_urls": list, "stored_url": str, "error": str}
+            ``ToolResult.ok(confirmation, data={image_urls, stored_url,
+            stored_hash})`` on success;
+            ``ToolResult.failed(error)`` otherwise.
         """
         if not self.enabled or not self.service:
-            return {
-                "success": False,
-                "error": "Image generation not available (missing REPLICATE_API_TOKEN)"
-            }
+            return ToolResult.failed(
+                "Image generation not available (missing REPLICATE_API_TOKEN)"
+            )
 
         try:
             logger.info(f"Generating {num_outputs} avatar options: {description[:50]}...")
@@ -932,10 +930,9 @@ Looking good! Want another one in a different style?"
             )
 
             if not image_urls:
-                return {
-                    "success": False,
-                    "error": "Avatar generation returned no results"
-                }
+                return ToolResult.failed(
+                    "Avatar generation returned no results"
+                )
 
             logger.info(f"✅ Generated {len(image_urls)} avatar options")
 
@@ -977,16 +974,18 @@ Looking good! Want another one in a different style?"
                     logger.error(f"Failed to store avatar in Kestrel: {e}")
                     # Continue - return Replicate URLs as fallback
 
-            return {
-                "success": True,
-                "image_urls": image_urls,
-                "stored_url": stored_url,
-                "stored_hash": stored_hash
-            }
+            return ToolResult.ok(
+                confirmation=(
+                    f"Generated {len(image_urls)} avatar option(s)"
+                    + (f"; primary stored as {stored_hash[:16]}…" if stored_hash else "")
+                ),
+                data={
+                    "image_urls": image_urls,
+                    "stored_url": stored_url,
+                    "stored_hash": stored_hash,
+                },
+            )
 
         except Exception as e:
             logger.error(f"Avatar generation error: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            return ToolResult.failed(str(e))
