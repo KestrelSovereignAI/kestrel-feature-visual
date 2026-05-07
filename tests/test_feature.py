@@ -4,6 +4,8 @@ import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+
 
 # =============================================================================
 # Fixtures
@@ -153,8 +155,9 @@ class TestGenerateAvatar:
             description="A friendly looking person"
         )
 
-        assert result["success"] is False
-        assert "not available" in result["error"].lower()
+        assert isinstance(result, ToolResult)
+        assert result.status is ToolResultStatus.ERROR
+        assert "not available" in result.error.lower()
 
 
 # =============================================================================
@@ -172,5 +175,31 @@ class TestGenerateSelfie:
 
         result = await feature_standalone.generate_selfie(scene="casual")
 
-        assert result["success"] is False
-        assert "not available" in result["error"].lower() or "replicate" in result["error"].lower()
+        assert isinstance(result, ToolResult)
+        assert result.status is ToolResultStatus.ERROR
+        assert ("not available" in result.error.lower()
+                or "replicate" in result.error.lower())
+
+
+# =============================================================================
+# Train LoRA Tests
+# =============================================================================
+
+
+class TestTrainLora:
+    """Tests for train_lora tool's ToolResult contract on the failure
+    paths reachable without RunPod credentials. The success path is
+    not exercised here because it requires real cloud creds; the
+    @cloud_resource integration tests cover that surface."""
+
+    @pytest.mark.asyncio
+    async def test_train_lora_without_companion_id_returns_failed(
+        self, feature_standalone
+    ):
+        """No companion_id and no agent.companion_context to fall back on
+        → ToolResult.failed with a descriptive error."""
+        result = await feature_standalone.train_lora()
+
+        assert isinstance(result, ToolResult)
+        assert result.status is ToolResultStatus.ERROR
+        assert "companion_id" in result.error.lower()

@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-feature-visual"
-version = "0.1.0"
+version = "0.2.0"
 description = "Visual identity for Kestrel Sovereign agents — avatar generation, selfies, and LoRA training for character consistency"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -31,7 +31,7 @@ classifiers = [
     "Topic :: Multimedia :: Graphics",
 ]
 dependencies = [
-    "kestrel-sovereign-sdk>=0.1,<1",
+    "kestrel-sovereign-sdk>=0.4,<1",
     "httpx>=0.27.0",
     "replicate>=1.0.4",
 ]
