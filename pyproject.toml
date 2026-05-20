@@ -1,9 +1,9 @@
 [project]
 name = "kestrel-feature-visual"
-version = "0.2.0"
+version = "0.2.1"
 description = "Visual identity for Kestrel Sovereign agents — avatar generation, selfies, and LoRA training for character consistency"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "UncleSaurus" }]
@@ -24,6 +24,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
@@ -31,7 +32,7 @@ classifiers = [
     "Topic :: Multimedia :: Graphics",
 ]
 dependencies = [
-    "kestrel-sovereign-sdk>=0.4,<1",
+    "kestrel-sovereign-sdk>=0.14.1,<1",
     "httpx>=0.27.0",
     "replicate>=1.0.4",
 ]
@@ -43,7 +44,7 @@ test = [
     # Integration tests touch kestrel_sovereign.features.training (lazy
     # provider factory the feature uses at runtime). Pinning the
     # framework here keeps the integration test self-contained.
-    "kestrel-sovereign>=0.5,<1",
+    "kestrel-sovereign>=0.13.1,<1",
 ]
 
 [project.urls]

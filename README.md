@@ -24,7 +24,7 @@ The feature is auto-discovered by Kestrel Sovereign via the `kestrel_sovereign.f
 
 ## Dependencies
 
-- `kestrel-sovereign-sdk>=0.1,<1` — base `Feature`, `tool`, and `ToolCategory` interfaces
+- `kestrel-sovereign-sdk>=0.14.1,<1` — base `Feature`, `tool`, and `ToolCategory` interfaces
 - `replicate>=1.0.4` — Replicate API client
 - `httpx>=0.27.0` — HTTP transport
 
