@@ -717,6 +717,21 @@ Looking good! Want another one in a different style?"
             )
             logger.info(f"Started LoRA training via {provider.provider_name}: {job.job_id}")
 
+            # Record canonical in-flight metadata for the SAME reason the
+            # blocking train_lora path does (codex round 7): this lazy
+            # generate_selfie(allow_training=True) dispatch returns without
+            # blocking, so without this write the job has no
+            # lora_training_status='running' / lora_job_id in avatar_config and
+            # active_handles() can't enumerate it — the reconciler would never
+            # finalize/clean it up. Every training dispatch path must record.
+            await self._record_inflight_training(
+                companion_id=companion_id,
+                job_id=job.job_id,
+                trigger_word=getattr(job, "trigger_word", None) or trigger_word,
+                provider=getattr(job, "provider", None) or provider.provider_name,
+                output_path=getattr(job, "output_path", None),
+            )
+
             # Return job info - actual path will be stored when training completes
             return f"training:{job.job_id}"
 

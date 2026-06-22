@@ -1072,3 +1072,48 @@ class TestStatusUnknownAfterRestart:
         assert s3.outcome is Outcome.PENDING
         assert s3.data["state"] == "training"
         assert "job-9" not in feature._status_unknown_attempts
+
+
+class TestLazyTrainingRecordsInflight:
+    """codex round 7: the lazy generate_selfie(allow_training=True) dispatch
+    path (_get_or_train_lora) must ALSO record in-flight metadata, else the
+    job is invisible to active_handles and the reconciler never finalizes it."""
+
+    @pytest.mark.asyncio
+    async def test_get_or_train_lora_records_inflight(self):
+        import types as _types
+
+        provider = FakeTrainingProvider([FakeStatus(_training_state().TRAINING)])
+        provider.provider_name = "vertex_ai"
+
+        async def fake_start_training(*, companion_id, avatar_data, config):
+            return _types.SimpleNamespace(
+                job_id="lazy-job-1",
+                provider="vertex_ai",
+                trigger_word=getattr(config, "trigger_word", None),
+                output_path=None,
+            )
+        provider.start_training = fake_start_training
+
+        db = FakeDbPool(rows={})
+        # The lazy path's avatar lookup uses a different SELECT shape; give the
+        # fake conn an avatar_data row for this companion.
+        db.conn.rows["comp-7"] = {}
+        async def fetchrow(sql, *params):
+            if "avatar_data" in sql:
+                return {"avatar_data": b"img-bytes", "image_url": None}
+            cid = params[0]
+            return {"avatar_config": db.conn.rows.get(cid)} if cid in db.conn.rows else None
+        db.conn.fetchrow = fetchrow
+
+        feature = make_feature(provider, db)
+        feature._get_training_provider = lambda name=None: provider
+
+        result = await feature._get_or_train_lora("comp-7")
+
+        assert result == "training:lazy-job-1"
+        # In-flight metadata persisted so active_handles can enumerate it.
+        cfg = db.conn.rows["comp-7"]
+        assert cfg["lora_training_status"] == "running"
+        assert cfg["lora_job_id"] == "lazy-job-1"
+        assert cfg["lora_provider"] == "vertex_ai"
