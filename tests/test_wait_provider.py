@@ -1167,3 +1167,27 @@ class TestLazyTrainingRecordsInflight:
         assert cfg["lora_training_status"] == "running"
         assert cfg["lora_job_id"] == "lazy-job-1"
         assert cfg["lora_provider"] == "vertex_ai"
+
+
+class TestTriggerWordKeyParity:
+    """codex round 10: the trigger must be persisted under BOTH lora_trigger_word
+    (finalizer's own recovery key) AND trigger_word (the key the selfie
+    generation path reads), else a custom trigger never activates the LoRA."""
+
+    @pytest.mark.asyncio
+    async def test_finalize_persists_trigger_under_both_keys(self):
+        TS = _training_state()
+        provider = FakeTrainingProvider([FakeStatus(TS.COMPLETED)])
+        db = FakeDbPool(rows={
+            "comp-1": {"lora_training_status": "running", "lora_job_id": "job-9",
+                       "lora_trigger_word": "TOKalice", "lora_provider": "fake_runpod"},
+        })
+        feature = make_feature(provider, db)
+        w = LoraTrainingWaitable(feature)
+
+        status = await w.poll("comp-1:job-9")
+        assert status.outcome is Outcome.DONE
+        cfg = db.conn.rows["comp-1"]
+        assert cfg["lora_trigger_word"] == "TOKalice"
+        # The generation-path key must also be set to the same value.
+        assert cfg["trigger_word"] == "TOKalice"

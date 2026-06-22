@@ -1014,6 +1014,10 @@ Looking good! Want another one in a different style?"
             "lora_job_id": job_id,
             "lora_provider": provider,
             "lora_trigger_word": trigger_word,
+            # Mirror under the key the generation path reads (see the finalize
+            # merge comment; codex round 10) so the trigger is right from
+            # dispatch onward, not only after terminal finalization.
+            "trigger_word": trigger_word,
             "lora_training_status": "running",
         }
         if output_path:
@@ -1216,6 +1220,14 @@ Looking good! Want another one in a different style?"
                 "lora_model_path": lora_path,
                 "lora_training_status": "finalizing",
                 "lora_trigger_word": trigger_word,
+                # Also persist under the key the SELFIE GENERATION path reads
+                # (`config.get("trigger_word")` / _lookup_lora_info). This was a
+                # PRE-EXISTING mismatch (finalize wrote only lora_trigger_word;
+                # generation read trigger_word), so a custom trigger like
+                # TOK<name> never activated the trained LoRA and generation fell
+                # back to TOK<companion_id>. Writing both keys fixes it for every
+                # LoRA finalized through this shared path (codex round 10).
+                "trigger_word": trigger_word,
                 "lora_provider": provider,
                 "lora_job_id": job_id,
             }
