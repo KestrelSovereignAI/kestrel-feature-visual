@@ -114,6 +114,15 @@ class VisualIdentityFeature(Feature):
         # in try/except so a repeat after a restart is harmless.
         self._finalized_jobs: set[str] = set()
 
+        # Per-job locks serialize concurrent terminal observers (blocking loop
+        # AND waitable/reconciler seeing the same job terminal at once). Without
+        # this, both could pass the ``_finalized_jobs`` membership check before
+        # either reaches ``.add`` after the awaited DB write, double-running
+        # persistence + cleanup. The locks dict itself is guarded by an
+        # asyncio.Lock so concurrent first-observers create exactly one per job.
+        self._finalize_locks: Dict[str, "asyncio.Lock"] = {}
+        self._finalize_locks_guard = asyncio.Lock()
+
         # Enable feature if a training provider with generation capability exists
         # (e.g., local_mps can generate selfies without Replicate)
         if not self.enabled and TRAINING_FACTORY_AVAILABLE:
@@ -704,6 +713,46 @@ Looking good! Want another one in a different style?"
             logger.error(f"Failed to lookup LoRA info for {companion_id}: {e}")
             return None
 
+    async def _lookup_inflight_metadata(
+        self, companion_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read the dispatch-recorded LoRA metadata from ``avatar_config``.
+
+        Returns the ``lora_trigger_word`` / ``lora_provider`` /
+        ``lora_output_path`` recorded at dispatch (see
+        :meth:`_record_inflight_training`), so the finalizer can recover them
+        when it runs from a status-only snapshot. Returns ``None`` if there is
+        no db_pool, no row, or unparseable config.
+        """
+        if not self.db_pool:
+            return None
+        try:
+            async with self.db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT avatar_config FROM companions WHERE id = $1",
+                    companion_id,
+                )
+            if not row:
+                return None
+            raw_config = row["avatar_config"]
+            if raw_config is None:
+                return None
+            if isinstance(raw_config, str):
+                try:
+                    config = json.loads(raw_config)
+                except json.JSONDecodeError:
+                    return None
+            else:
+                config = raw_config
+            return {
+                "lora_trigger_word": config.get("lora_trigger_word"),
+                "lora_provider": config.get("lora_provider"),
+                "lora_output_path": config.get("lora_output_path"),
+            }
+        except Exception as e:
+            logger.error(f"Failed to look up in-flight metadata for {companion_id}: {e}")
+            return None
+
     async def _train_lora_for_companion(self, companion_id: str) -> Optional[str]:
         """
         Train a LoRA model for a companion using the unified TrainingProviderFactory.
@@ -782,6 +831,22 @@ Looking good! Want another one in a different style?"
 
             logger.info(f"📊 Training job started: {job.job_id} via {job.provider}")
 
+            # Persist the canonical in-flight metadata into avatar_config BEFORE
+            # entering the poll loop. This is the durable source of truth the
+            # finalizer reads when it runs from a status-only snapshot (the
+            # LoraTrainingWaitable / reconciler path) that lacks the job's
+            # trigger_word/provider — without it the jsonb merge would clobber
+            # lora_trigger_word with null and persist a useless fallback path.
+            # It also marks the job ``running`` so ``active_handles`` can
+            # enumerate it for auto-wake.
+            await self._record_inflight_training(
+                companion_id=companion_id,
+                job_id=job.job_id,
+                trigger_word=job.trigger_word,
+                provider=job.provider,
+                output_path=job.output_path,
+            )
+
             # Poll for completion (training takes ~15-20 min)
             max_wait = TRAINING_TIMEOUT_EXTENDED  # 30 minutes max
             poll_interval = TRAINING_POLL_INTERVAL  # Check every 30 seconds
@@ -807,6 +872,11 @@ Looking good! Want another one in a different style?"
                         trigger_word=job.trigger_word,
                         output_path=job.output_path,
                         error=status.error,
+                        # The real output path (e.g. Vertex's gcs_output_path)
+                        # often only appears in the terminal status, not on the
+                        # dispatch-time job; pass it through so the blocking path
+                        # resolves the same canonical path as the provider path.
+                        provider_details=getattr(status, "provider_details", None),
                     )
 
                 logger.info(f"⏳ Training progress: {status.progress*100:.0f}% ({status.state.value})")
@@ -835,6 +905,81 @@ Looking good! Want another one in a different style?"
             logger.error(f"LoRA training failed for {companion_id}: {e}", exc_info=True)
             return None
 
+    async def _record_inflight_training(
+        self,
+        companion_id: str,
+        job_id: str,
+        trigger_word: Optional[str] = None,
+        provider: Optional[str] = None,
+        output_path: Optional[str] = None,
+    ) -> None:
+        """Persist the canonical in-flight job metadata at DISPATCH time.
+
+        Writes the fields known the moment ``start_training`` returns —
+        ``lora_job_id``, ``lora_trigger_word``, ``lora_provider``,
+        ``lora_training_status="running"`` (and ``lora_output_path`` when
+        already known) — into the companion's ``avatar_config`` via an
+        idempotent jsonb merge. This is the canonical record the finalizer
+        recovers ``trigger_word``/``provider`` from when it runs from a
+        status-only snapshot, and the row ``active_handles`` enumerates for
+        auto-wake. Only non-None fields are merged so nothing is clobbered.
+        """
+        if not self.db_pool:
+            logger.warning(
+                f"No db_pool to record in-flight training for {companion_id}; "
+                f"job {job_id} dispatched without durable metadata"
+            )
+            return
+
+        merge: Dict[str, Any] = {
+            "lora_job_id": job_id,
+            "lora_provider": provider,
+            "lora_trigger_word": trigger_word,
+            "lora_training_status": "running",
+        }
+        if output_path:
+            merge["lora_output_path"] = output_path
+        merge = {k: v for k, v in merge.items() if v is not None}
+
+        try:
+            async with self.db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE companions
+                    SET avatar_config = COALESCE(avatar_config, '{}'::jsonb) || $1::jsonb
+                    WHERE id = $2
+                    """,
+                    json.dumps(merge),
+                    companion_id,
+                )
+        except Exception as e:
+            logger.error(f"Failed to record in-flight training for {companion_id}: {e}")
+
+    @staticmethod
+    def _resolve_lora_path(
+        provider: Optional[str],
+        job_id: str,
+        output_path: Optional[str],
+        provider_details: Optional[Dict[str, Any]],
+    ) -> str:
+        """Resolve the canonical LoRA output path from the best source.
+
+        Providers expose the real model location under different keys: Vertex
+        AI puts it in ``provider_details["gcs_output_path"]`` while others set
+        the top-level ``output_path``. Prefer any usable explicit path, in
+        order, and only fall back to the opaque ``"<provider>:<job_id>"`` sentinel
+        if none is available.
+        """
+        details = provider_details or {}
+        for candidate in (
+            details.get("gcs_output_path"),
+            details.get("output_path"),
+            output_path,
+        ):
+            if candidate:
+                return candidate
+        return f"{provider}:{job_id}" if provider else job_id
+
     async def _finalize_training(
         self,
         companion_id: str,
@@ -844,6 +989,7 @@ Looking good! Want another one in a different style?"
         trigger_word: Optional[str] = None,
         output_path: Optional[str] = None,
         error: Optional[str] = None,
+        provider_details: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Run the terminal side effects for a training job EXACTLY ONCE.
 
@@ -873,63 +1019,174 @@ Looking good! Want another one in a different style?"
             provider: Provider name, for the ``lora_provider`` field and the
                 ``"{provider}:{job_id}"`` fallback path. May be ``None`` when
                 reconstructed from a status-only poll.
-            trigger_word: LoRA trigger word, persisted when known.
-            output_path: Provider output path, if known.
+            trigger_word: LoRA trigger word, persisted when known. May be
+                ``None`` on the status-only (provider/reconciler) path; it is
+                then recovered from the dispatch-recorded ``avatar_config`` so
+                the merge never overwrites the recorded value with null.
+            output_path: Provider top-level output path, if known.
             error: Failure/cancellation reason, for logging only.
+            provider_details: Provider-specific status detail dict (e.g. Vertex
+                AI's ``gcs_output_path``), used to resolve the real LoRA path.
 
         Returns:
             The LoRA path on success, else ``None``.
         """
         from kestrel_sovereign.features.training.types import TrainingState
 
-        # Idempotency guard: only the FIRST observer of a terminal job runs the
-        # side effects. ``cleanup`` is still exception-tolerant below so a
-        # post-restart repeat (guard reset to empty) cannot raise.
+        # Recover canonical metadata persisted at dispatch when the caller
+        # (the status-only provider/reconciler path) doesn't have it. This is
+        # what keeps the jsonb merge from clobbering lora_trigger_word with
+        # null and lets us fall back to the dispatch-recorded output path.
+        recorded_output_path: Optional[str] = None
+        if trigger_word is None or provider is None or not output_path:
+            recorded = await self._lookup_inflight_metadata(companion_id)
+            if recorded:
+                if trigger_word is None:
+                    trigger_word = recorded.get("lora_trigger_word")
+                if provider is None:
+                    provider = recorded.get("lora_provider")
+                recorded_output_path = recorded.get("lora_output_path")
+
+        # Serialize concurrent terminal observers of THIS job behind a per-job
+        # lock so the check-then-add guard (with an awaited DB write between) is
+        # atomic — otherwise two coroutines could both pass the membership check
+        # and double-run persistence + cleanup.
+        lock = await self._get_finalize_lock(job_id)
+        async with lock:
+            return await self._finalize_training_locked(
+                companion_id=companion_id,
+                job_id=job_id,
+                terminal_state=terminal_state,
+                provider=provider,
+                trigger_word=trigger_word,
+                output_path=output_path,
+                recorded_output_path=recorded_output_path,
+                error=error,
+                provider_details=provider_details,
+            )
+
+    async def _get_finalize_lock(self, job_id: str) -> "asyncio.Lock":
+        """Return the per-job finalize lock, creating it atomically.
+
+        Lazily materializes the locks dict + guard if they were not set up by
+        ``initialize()`` (e.g. a feature constructed directly for standalone /
+        test use), so finalization is concurrency-safe regardless of wiring.
+        The guard is created in a single synchronous step (no await), so two
+        coroutines cannot race to create two guards.
+        """
+        guard = getattr(self, "_finalize_locks_guard", None)
+        if guard is None:
+            guard = asyncio.Lock()
+            self._finalize_locks_guard = guard
+            self._finalize_locks = {}
+        async with guard:
+            lock = self._finalize_locks.get(job_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._finalize_locks[job_id] = lock
+            return lock
+
+    async def _finalize_training_locked(
+        self,
+        companion_id: str,
+        job_id: str,
+        terminal_state: "TrainingState",
+        provider: Optional[str],
+        trigger_word: Optional[str],
+        output_path: Optional[str],
+        recorded_output_path: Optional[str],
+        error: Optional[str],
+        provider_details: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Critical section of :meth:`_finalize_training`, run under the per-job lock."""
+        from kestrel_sovereign.features.training.types import TrainingState
+
+        # Idempotency guard: once a job is in ``_finalized_jobs`` its terminal
+        # persistence has SUCCEEDED, so further observers skip the side effects.
+        # Cleanup (pod teardown) is exception-tolerant so a repeat — when a prior
+        # call ran cleanup but its DB write failed (job NOT added to the guard),
+        # or after a restart reset the guard — cannot raise.
         if job_id in self._finalized_jobs:
             logger.debug(f"Training job {job_id} already finalized; skipping side effects")
             if terminal_state == TrainingState.COMPLETED:
-                return output_path or (f"{provider}:{job_id}" if provider else None)
+                return self._resolve_lora_path(
+                    provider, job_id, output_path or recorded_output_path, provider_details
+                )
             return None
-        self._finalized_jobs.add(job_id)
 
         if terminal_state == TrainingState.COMPLETED:
-            lora_path = output_path or f"{provider}:{job_id}"
+            lora_path = self._resolve_lora_path(
+                provider, job_id, output_path or recorded_output_path, provider_details
+            )
             logger.info(f"✅ Training completed: {lora_path}")
 
             # Update companion's avatar_config with LoRA info. The jsonb merge
-            # (COALESCE(...) || $1) is idempotent — repeating it overwrites the
-            # same keys with the same values.
-            if self.db_pool:
-                try:
-                    async with self.db_pool.acquire() as conn:
-                        await conn.execute("""
-                            UPDATE companions
-                            SET avatar_config = COALESCE(avatar_config, '{}'::jsonb) || $1::jsonb
-                            WHERE id = $2
-                        """, json.dumps({
-                            "lora_model_path": lora_path,
-                            "lora_training_status": "completed",
-                            "lora_trigger_word": trigger_word,
-                            "lora_provider": provider,
-                            "lora_job_id": job_id
-                        }), companion_id)
-                except Exception as e:
-                    logger.error(f"Failed to update avatar_config: {e}")
-            else:
-                logger.warning(
-                    f"No db_pool to persist LoRA for {companion_id}; job {job_id} finalized without persistence"
-                )
-
+            # (COALESCE(...) || $1) is idempotent. Build the merge dict
+            # CONDITIONALLY: only include keys whose values are non-None so a
+            # missing trigger_word/provider never overwrites the value recorded
+            # at dispatch.
+            merge: Dict[str, Any] = {
+                "lora_model_path": lora_path,
+                "lora_training_status": "completed",
+                "lora_trigger_word": trigger_word,
+                "lora_provider": provider,
+                "lora_job_id": job_id,
+            }
+            persisted = await self._persist_terminal_status(companion_id, job_id, merge)
+            # Only mark finalized when the terminal status actually landed (or
+            # there is no db_pool to land it in). On a transient DB failure we
+            # leave the row ``running`` AND the guard empty so the reconciler /
+            # a later poll retries the whole terminal sequence — otherwise the
+            # job would be enumerated by active_handles forever, never persisted.
+            if persisted:
+                self._finalized_jobs.add(job_id)
+            # Cleanup is idempotent; run it so the pod is torn down (stop billing)
+            # even if a later retry re-runs it.
             await self._safe_cleanup(job_id)
             return lora_path
 
-        # FAILED / CANCELLED
+        # FAILED / CANCELLED: mark the job terminal so it is no longer enumerated
+        # as in-flight by active_handles, then tear down resources.
+        terminal_status = "failed" if terminal_state == TrainingState.FAILED else "cancelled"
         if terminal_state == TrainingState.FAILED:
             logger.error(f"Training failed: {error or 'Unknown error'}")
         else:
             logger.warning(f"Training was cancelled: {error or 'cancelled'}")
+        persisted = await self._persist_terminal_status(
+            companion_id, job_id, {"lora_training_status": terminal_status}
+        )
+        if persisted:
+            self._finalized_jobs.add(job_id)
         await self._safe_cleanup(job_id)
         return None
+
+    async def _persist_terminal_status(
+        self, companion_id: str, job_id: str, merge: Dict[str, Any]
+    ) -> bool:
+        """Persist terminal LoRA metadata into ``avatar_config`` (jsonb merge).
+
+        Drops None values so a missing trigger_word/provider never overwrites
+        the value recorded at dispatch. Returns ``True`` when the write landed
+        (or there is no db_pool to write to — nothing to retry), ``False`` on a
+        transient DB error so the caller leaves the job un-finalized for retry.
+        """
+        if not self.db_pool:
+            logger.warning(
+                f"No db_pool to persist LoRA for {companion_id}; job {job_id} finalized without persistence"
+            )
+            return True
+        merge = {k: v for k, v in merge.items() if v is not None}
+        try:
+            async with self.db_pool.acquire() as conn:
+                await conn.execute("""
+                    UPDATE companions
+                    SET avatar_config = COALESCE(avatar_config, '{}'::jsonb) || $1::jsonb
+                    WHERE id = $2
+                """, json.dumps(merge), companion_id)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to persist terminal status for {companion_id} (job {job_id}): {e}")
+            return False
 
     async def _safe_cleanup(self, job_id: str) -> None:
         """Tear down provider resources for ``job_id``, tolerating errors.
