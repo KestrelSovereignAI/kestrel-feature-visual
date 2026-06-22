@@ -198,6 +198,22 @@ class LoraTrainingWaitable:
                     exc,
                 )
                 unknown_counter.pop(job_id, None)
+                # Route through the shared finalizer so the terminal FAILED state
+                # is PERSISTED (avatar_config -> failed + guard). Returning a bare
+                # FAILED WaitStatus would leave the row 'running'/'finalizing', so
+                # active_handles would keep enumerating and re-polling this job
+                # forever instead of stopping (codex round 6).
+                failed_state = self._terminal_state_for("failed", False, True)
+                await self._feature._finalize_training(
+                    companion_id=companion_id,
+                    job_id=job_id,
+                    terminal_state=failed_state,
+                    provider=getattr(provider, "provider_name", None),
+                    trigger_word=None,
+                    output_path=None,
+                    error=f"status unrecoverable after {attempts} attempts: {exc}",
+                    provider_details=None,
+                )
                 return WaitStatus(
                     Outcome.FAILED,
                     f"status unrecoverable for {job_id} after restart",

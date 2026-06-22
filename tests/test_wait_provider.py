@@ -1030,6 +1030,12 @@ class TestStatusUnknownAfterRestart:
         assert final.data["status_error"] == "no such session after restart"
         # Counter cleared after the terminal decision.
         assert feature._status_unknown_attempts.get("job-9") is None
+        # codex round 6: the terminal FAILED must be PERSISTED + guarded, else
+        # active_handles would keep enumerating this job forever.
+        assert db.conn.rows["comp-1"]["lora_training_status"] == "failed"
+        assert "job-9" in feature._finalized_jobs
+        # And it is no longer enumerated as in-flight.
+        assert await w.active_handles() == []
 
     @pytest.mark.asyncio
     async def test_successful_get_status_resets_counter(self):
