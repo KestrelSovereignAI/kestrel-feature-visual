@@ -338,6 +338,22 @@ class LoraTrainingWaitable:
         }
 
         if terminal_done or terminal_failed or terminal_cancelled:
+            # KNOWN LIMITATION (TrainingProvider contract gap, codex round 13 —
+            # tracked in kestrel-feature-lora#3): a session-based provider whose
+            # in-memory _jobs cache is empty after a host restart may return
+            # get_status() == FAILED("Job not found") for a job that is STILL
+            # RUNNING remotely. At this layer that is indistinguishable from a
+            # genuine remote failure, so it is finalized FAILED. We deliberately
+            # add NO error-string heuristic here — sniffing "not found" would be
+            # fragile and would also mask real failures whose message happens to
+            # match. The correct fix is provider-side: get_status() must either
+            # rehydrate from durable state or return a distinct "unknown" status
+            # (not FAILED) when it has lost the job locally. This only affects
+            # jobs in flight ACROSS a restart on providers with that behavior;
+            # the get_status-RAISES variant is already handled above as a bounded
+            # transient-unknown, and completed jobs are recovered from the
+            # persisted lora_model_path.
+            #
             # Route through the shared idempotent finalizer so the pod is torn
             # down and (on success) the LoRA persisted exactly once, whether
             # this provider or the blocking loop observed terminal first.
