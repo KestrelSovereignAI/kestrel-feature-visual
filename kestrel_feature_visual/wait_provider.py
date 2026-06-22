@@ -188,6 +188,61 @@ class LoraTrainingWaitable:
             attempts = unknown_counter.get(job_id, 0) + 1
             unknown_counter[job_id] = attempts
             if attempts >= MAX_STATUS_UNKNOWN_ATTEMPTS:
+                unknown_counter.pop(job_id, None)
+                # Before forcing FAILED, consult the dispatch-recorded metadata.
+                # A job whose poll now raises (session cleaned up) MAY actually
+                # have COMPLETED: _finalize_training already persisted
+                # ``lora_model_path`` and set status "finalizing", cleanup
+                # removed the provider session — only the final
+                # finalizing->completed DB write failed transiently. Such a job
+                # is enumerated as "finalizing", so re-polling lands here once
+                # get_status raises. If a real ``lora_model_path`` is persisted,
+                # the LoRA is done; finalizing it FAILED would overwrite a
+                # completed model (codex P2). Recover it as COMPLETED instead.
+                recorded = None
+                lookup = getattr(self._feature, "_lookup_inflight_metadata", None)
+                if callable(lookup):
+                    try:
+                        recorded = await lookup(companion_id)
+                    except Exception:
+                        recorded = None
+                recorded_model_path = (recorded or {}).get("lora_model_path")
+                provider_name = getattr(provider, "provider_name", None)
+
+                if recorded_model_path:
+                    logger.warning(
+                        "get_status for training job %s failed %d times "
+                        "(provider lost its session after a restart), but a "
+                        "completed LoRA is already persisted at %s; recovering "
+                        "the job as COMPLETED rather than overwriting it FAILED. "
+                        "Last error: %s",
+                        job_id,
+                        attempts,
+                        recorded_model_path,
+                        exc,
+                    )
+                    completed_state = self._terminal_state_for("completed", True, False)
+                    await self._feature._finalize_training(
+                        companion_id=companion_id,
+                        job_id=job_id,
+                        terminal_state=completed_state,
+                        provider=(recorded or {}).get("lora_provider") or provider_name,
+                        trigger_word=None,
+                        output_path=recorded_model_path,
+                        error=None,
+                        provider_details=None,
+                    )
+                    return WaitStatus(
+                        Outcome.DONE,
+                        f"LoRA {job_id} completed (status recovered from "
+                        f"persisted metadata after session loss)",
+                        data={
+                            "companion_id": companion_id,
+                            "job_id": job_id,
+                            "lora_path": recorded_model_path,
+                        },
+                    )
+
                 logger.error(
                     "🚨 get_status for training job %s failed %d times "
                     "(provider likely lost its session after a restart); "
@@ -197,7 +252,6 @@ class LoraTrainingWaitable:
                     attempts,
                     exc,
                 )
-                unknown_counter.pop(job_id, None)
                 # Route through the shared finalizer so the terminal FAILED state
                 # is PERSISTED (avatar_config -> failed + guard). Returning a bare
                 # FAILED WaitStatus would leave the row 'running'/'finalizing', so
@@ -208,7 +262,7 @@ class LoraTrainingWaitable:
                     companion_id=companion_id,
                     job_id=job_id,
                     terminal_state=failed_state,
-                    provider=getattr(provider, "provider_name", None),
+                    provider=provider_name,
                     trigger_word=None,
                     output_path=None,
                     error=f"status unrecoverable after {attempts} attempts: {exc}",

@@ -825,6 +825,8 @@ Looking good! Want another one in a different style?"
                 "lora_trigger_word": config.get("lora_trigger_word"),
                 "lora_provider": config.get("lora_provider"),
                 "lora_output_path": config.get("lora_output_path"),
+                "lora_model_path": config.get("lora_model_path"),
+                "lora_training_status": config.get("lora_training_status"),
             }
         except Exception as e:
             logger.error(f"Failed to look up in-flight metadata for {companion_id}: {e}")

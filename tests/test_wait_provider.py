@@ -999,6 +999,8 @@ class TestStatusUnknownAfterRestart:
     async def test_get_status_raise_is_pending_then_failed(self):
         from kestrel_feature_visual.wait_provider import MAX_STATUS_UNKNOWN_ATTEMPTS
 
+        # No persisted lora_model_path: the job genuinely never completed, so
+        # after the cap it must finalize FAILED.
         db = FakeDbPool(rows={
             "comp-1": {"lora_training_status": "running", "lora_job_id": "job-9",
                        "lora_trigger_word": "TOK", "lora_provider": "vertex_ai"},
@@ -1035,6 +1037,54 @@ class TestStatusUnknownAfterRestart:
         assert db.conn.rows["comp-1"]["lora_training_status"] == "failed"
         assert "job-9" in feature._finalized_jobs
         # And it is no longer enumerated as in-flight.
+        assert await w.active_handles() == []
+
+    @pytest.mark.asyncio
+    async def test_completed_job_recovered_not_marked_failed(self):
+        """codex P2 data-correctness: a job that already COMPLETED (its
+        ``lora_model_path`` is persisted and status is "finalizing" because the
+        final finalizing->completed write failed transiently) must NOT be
+        overwritten FAILED when get_status later raises (session cleaned up).
+        After the cap, poll() recovers it as COMPLETED from the persisted
+        metadata."""
+        from kestrel_feature_visual.wait_provider import MAX_STATUS_UNKNOWN_ATTEMPTS
+
+        model_path = "gs://bucket/loras/comp-1/weights.safetensors"
+        db = FakeDbPool(rows={
+            "comp-1": {
+                "lora_training_status": "finalizing",
+                "lora_job_id": "job-9",
+                "lora_trigger_word": "TOK",
+                "lora_provider": "vertex_ai",
+                "lora_model_path": model_path,
+            },
+        })
+        provider = FakeTrainingProvider([])  # statuses unused; get_status overridden
+        provider.provider_name = "vertex_ai"
+
+        async def boom(job_id):
+            raise RuntimeError("no such session after restart")
+        provider.get_status = boom
+        feature = make_feature(provider, db)
+        w = LoraTrainingWaitable(feature)
+
+        # First N-1 polls: transient unknown -> PENDING; job stays finalizing.
+        for i in range(MAX_STATUS_UNKNOWN_ATTEMPTS - 1):
+            s = await w.poll("comp-1:job-9")
+            assert s.outcome is Outcome.PENDING
+            assert db.conn.rows["comp-1"]["lora_training_status"] == "finalizing"
+            assert "job-9" not in feature._finalized_jobs
+
+        # The cap-th poll: recover the already-completed job as DONE, NOT FAILED.
+        final = await w.poll("comp-1:job-9")
+        assert final.outcome is Outcome.DONE
+        assert "recovered from persisted metadata" in final.summary
+        assert final.data["lora_path"] == model_path
+        # Persisted status is now "completed" and the path is preserved.
+        assert db.conn.rows["comp-1"]["lora_training_status"] == "completed"
+        assert db.conn.rows["comp-1"]["lora_model_path"] == model_path
+        # Job is finalized + no longer enumerated as in-flight.
+        assert "job-9" in feature._finalized_jobs
         assert await w.active_handles() == []
 
     @pytest.mark.asyncio
