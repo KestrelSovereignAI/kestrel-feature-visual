@@ -1224,12 +1224,25 @@ Looking good! Want another one in a different style?"
             # active_handles forever, never persisted.
             if not persisted:
                 return lora_path
-            await self._cleanup_then_commit_terminal(
+            committed = await self._cleanup_then_commit_terminal(
                 companion_id=companion_id,
                 job_id=job_id,
                 provider=provider,
                 terminal_status="completed",
             )
+            # The LoRA itself is trained and the path is valid, so we return it
+            # (the caller's LoRA IS ready). But if pod teardown is still pending
+            # (cleanup failed retryably) the avatar_config status stays
+            # "finalizing", NOT "completed" — surface that honestly rather than
+            # letting a "completed" reading imply all resources are freed. The
+            # reconciler keeps retrying cleanup until it lands (or the cap forces
+            # terminal with a loud log).
+            if not committed:
+                logger.warning(
+                    f"LoRA {job_id} trained (path ready) but pod teardown is "
+                    f"still finalizing; status remains 'finalizing' until cleanup "
+                    f"lands. Path: {lora_path}"
+                )
             return lora_path
 
         # FAILED / CANCELLED: same shape — set an intermediate "finalizing"
@@ -1259,8 +1272,13 @@ Looking good! Want another one in a different style?"
         job_id: str,
         provider: Optional[str],
         terminal_status: str,
-    ) -> None:
+    ) -> bool:
         """Run cleanup; on SUCCESS commit the terminal status + finalized guard.
+
+        Returns ``True`` when the terminal status was fully committed (cleanup
+        landed, or the retry cap was force-committed), ``False`` when the job is
+        left ``"finalizing"`` for a later retry. Callers use this to avoid
+        claiming clean completion while pod teardown is still pending.
 
         Implements the codex P2-B contract: a job's terminal status (and the
         ``_finalized_jobs`` guard that blocks re-finalization) is committed ONLY
@@ -1282,7 +1300,8 @@ Looking good! Want another one in a different style?"
             if persisted:
                 self._finalized_jobs.add(job_id)
                 self._cleanup_attempts.pop(job_id, None)
-            return
+                return True
+            return False
 
         # Cleanup failed transiently. Count the attempt; leave status
         # "finalizing" and the guard empty so the next poll retries — UNLESS we
@@ -1301,11 +1320,14 @@ Looking good! Want another one in a different style?"
             if persisted:
                 self._finalized_jobs.add(job_id)
                 self._cleanup_attempts.pop(job_id, None)
-        else:
-            logger.warning(
-                f"Cleanup for training job {job_id} failed (attempt {attempts}/"
-                f"{MAX_CLEANUP_ATTEMPTS}); job left 'finalizing' for retry"
-            )
+            # Force-committed (cap reached): treat as terminally committed even
+            # though the pod may still be billing — it's been surfaced loudly.
+            return bool(persisted)
+        logger.warning(
+            f"Cleanup for training job {job_id} failed (attempt {attempts}/"
+            f"{MAX_CLEANUP_ATTEMPTS}); job left 'finalizing' for retry"
+        )
+        return False
 
     async def _persist_terminal_status(
         self, companion_id: str, job_id: str, merge: Dict[str, Any]
