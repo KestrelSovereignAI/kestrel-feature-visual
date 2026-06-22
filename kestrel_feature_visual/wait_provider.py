@@ -232,6 +232,25 @@ class LoraTrainingWaitable:
                         error=None,
                         provider_details=None,
                     )
+                    # Mirror the normal terminal path's guard (codex round 12):
+                    # _finalize_training only adds to _finalized_jobs once cleanup
+                    # + the final DB commit land. If finalization is still pending
+                    # (cleanup/commit failed), report PENDING — not DONE — so the
+                    # wait/reconciler keeps polling and doesn't signal completion
+                    # while avatar_config is still 'finalizing'.
+                    finalized = getattr(self._feature, "_finalized_jobs", None)
+                    if finalized is not None and job_id not in finalized:
+                        return WaitStatus(
+                            Outcome.PENDING,
+                            f"LoRA {job_id} completed (recovered from persisted "
+                            f"metadata) but finalization not yet committed; retrying",
+                            data={
+                                "companion_id": companion_id,
+                                "job_id": job_id,
+                                "lora_path": recorded_model_path,
+                                "finalization_pending": True,
+                            },
+                        )
                     return WaitStatus(
                         Outcome.DONE,
                         f"LoRA {job_id} completed (status recovered from "
