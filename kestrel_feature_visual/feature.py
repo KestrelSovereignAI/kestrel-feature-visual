@@ -142,6 +142,13 @@ class VisualIdentityFeature(Feature):
         # avoid an infinite finalizing loop on a permanently-erroring cleanup.
         self._cleanup_attempts: Dict[str, int] = {}
 
+        # Per-job counter of consecutive ``get_status`` failures, used by the
+        # LoraTrainingWaitable. A session-based provider recreated after a
+        # restart loses its in-memory session, so polling a persisted job can
+        # RAISE; the waitable degrades that to a bounded PENDING retry then a
+        # terminal FAILED (rather than a job silently skipped every tick).
+        self._status_unknown_attempts: Dict[str, int] = {}
+
         # Enable feature if a training provider with generation capability exists
         # (e.g., local_mps can generate selfies without Replicate)
         if not self.enabled and TRAINING_FACTORY_AVAILABLE:
@@ -1352,6 +1359,17 @@ Looking good! Want another one in a different style?"
             return False
         try:
             await provider.cleanup(job_id)
+            # KNOWN LIMITATION (TrainingProvider contract gap, codex P2): a
+            # cleanup() that returns None is treated as success because the
+            # provider's contract gives us nothing better — session-based
+            # providers catch teardown/network errors internally and return
+            # None, so we CANNOT distinguish a real teardown from a silently
+            # swallowed failure. The finalizing-retry only helps when cleanup
+            # RAISES; a swallowed failure will be finalized as done and the pod
+            # may still be billing. Fixing this requires the provider to report
+            # teardown failures (raise or return a status), not visual. We
+            # deliberately add NO fragile heuristic here: raise=failure→retry,
+            # None=success.
             return True
         except Exception as e:
             # A session already torn down on a prior finalization (or after a

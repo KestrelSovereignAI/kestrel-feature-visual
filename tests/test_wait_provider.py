@@ -985,3 +985,84 @@ class TestFinalizingRetry:
         assert second.outcome is Outcome.FAILED
         assert db.conn.rows["comp-1"]["lora_training_status"] == "failed"
         assert "job-9" in feature._finalized_jobs
+
+
+# ---------------------------------------------------------------------------
+# Restart status-lookup crash (codex P2): get_status can RAISE for a persisted
+# job after a restart (session-based provider recreated without _active_jobs).
+# poll() must degrade cleanly — PENDING (retry) for the first attempts, FAILED
+# after the bound, and a successful read resets the per-job counter.
+# ---------------------------------------------------------------------------
+
+class TestStatusUnknownAfterRestart:
+    @pytest.mark.asyncio
+    async def test_get_status_raise_is_pending_then_failed(self):
+        from kestrel_feature_visual.wait_provider import MAX_STATUS_UNKNOWN_ATTEMPTS
+
+        db = FakeDbPool(rows={
+            "comp-1": {"lora_training_status": "running", "lora_job_id": "job-9",
+                       "lora_trigger_word": "TOK", "lora_provider": "vertex_ai"},
+        })
+        provider = FakeTrainingProvider([])  # statuses unused; get_status overridden
+        provider.provider_name = "vertex_ai"
+
+        async def boom(job_id):
+            raise RuntimeError("no such session after restart")
+        provider.get_status = boom
+        feature = make_feature(provider, db)
+        w = LoraTrainingWaitable(feature)
+
+        # First N-1 polls: transient unknown -> PENDING (not propagated).
+        for i in range(MAX_STATUS_UNKNOWN_ATTEMPTS - 1):
+            s = await w.poll("comp-1:job-9")
+            assert s.outcome is Outcome.PENDING
+            assert "status unavailable for job-9" in s.summary
+            assert s.data["status_error"] == "no such session after restart"
+            assert s.data["status_unknown_attempts"] == i + 1
+            # No terminal write yet; job stays enumerated.
+            assert db.conn.rows["comp-1"]["lora_training_status"] == "running"
+            assert "job-9" not in feature._finalized_jobs
+
+        # The bound-th attempt: terminal FAILED so the job stops being enumerated.
+        final = await w.poll("comp-1:job-9")
+        assert final.outcome is Outcome.FAILED
+        assert "status unrecoverable for job-9 after restart" in final.summary
+        assert final.data["status_error"] == "no such session after restart"
+        # Counter cleared after the terminal decision.
+        assert feature._status_unknown_attempts.get("job-9") is None
+
+    @pytest.mark.asyncio
+    async def test_successful_get_status_resets_counter(self):
+        TS = _training_state()
+        db = FakeDbPool(rows={
+            "comp-1": {"lora_training_status": "running", "lora_job_id": "job-9",
+                       "lora_trigger_word": "TOK", "lora_provider": "vertex_ai"},
+        })
+        provider = FakeTrainingProvider([])
+        provider.provider_name = "vertex_ai"
+
+        # Fail twice, then succeed (TRAINING) on the third call.
+        calls = {"n": 0}
+
+        async def flaky(job_id):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise RuntimeError("lost session")
+            return FakeStatus(TS.TRAINING, progress=0.6)
+        provider.get_status = flaky
+        feature = make_feature(provider, db)
+        w = LoraTrainingWaitable(feature)
+
+        s1 = await w.poll("comp-1:job-9")
+        assert s1.outcome is Outcome.PENDING
+        assert feature._status_unknown_attempts["job-9"] == 1
+        s2 = await w.poll("comp-1:job-9")
+        assert s2.outcome is Outcome.PENDING
+        assert feature._status_unknown_attempts["job-9"] == 2
+
+        # Third poll: get_status succeeds -> normal PENDING (training) AND the
+        # transient-unknown counter is cleared.
+        s3 = await w.poll("comp-1:job-9")
+        assert s3.outcome is Outcome.PENDING
+        assert s3.data["state"] == "training"
+        assert "job-9" not in feature._status_unknown_attempts

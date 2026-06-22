@@ -36,9 +36,21 @@ classifies via ``poll``.
 
 from __future__ import annotations
 
+import logging
 from typing import ClassVar, Optional, Tuple
 
 from kestrel_sdk.tools import Outcome, WaitStatus
+
+logger = logging.getLogger(__name__)
+
+# A session-based training provider recreated after a host restart has no
+# in-memory record of a persisted job (its ``_active_jobs``/session is gone), so
+# ``get_status(job_id)`` can RAISE. We treat such a raise as a TRANSIENT
+# unknown-status and report PENDING for this many polls so the reconciler keeps
+# retrying while the backend (re)hydrates its session. Once exceeded we finalize
+# the job FAILED so it stops being enumerated forever (silent-stuck) — mirroring
+# MAX_CLEANUP_ATTEMPTS' bounded-retry philosophy.
+MAX_STATUS_UNKNOWN_ATTEMPTS = 5
 
 
 class LoraTrainingWaitable:
@@ -54,6 +66,22 @@ class LoraTrainingWaitable:
         # The owning VisualIdentityFeature; provides _training_provider and the
         # shared idempotent _finalize_training.
         self._feature = feature
+
+    def _status_unknown_attempts(self) -> dict:
+        """Per-job counter of consecutive ``get_status`` failures (transient).
+
+        Lives on the owning feature (mirroring ``_cleanup_attempts``) so it
+        survives across polls of the same provider instance. Lazily created if
+        the feature was built without it (e.g. older ``initialize`` / tests).
+        """
+        counter = getattr(self._feature, "_status_unknown_attempts", None)
+        if counter is None:
+            counter = {}
+            try:
+                self._feature._status_unknown_attempts = counter
+            except Exception:
+                pass
+        return counter
 
     @staticmethod
     def _parse(handle: str) -> Tuple[str, str]:
@@ -145,7 +173,56 @@ class LoraTrainingWaitable:
                     data={"companion_id": companion_id, "job_id": job_id},
                 )
 
-        status = await provider.get_status(job_id)
+        # A session-based provider recreated after a restart has lost its
+        # in-memory session, so ``get_status`` for a persisted job can RAISE.
+        # The host reconciler catches a raising poll (so it's not a hard crash),
+        # but a job whose poll raises every tick is silently SKIPPED forever and
+        # never resolves. Degrade cleanly: treat a raise as a transient
+        # unknown-status — PENDING (retry) for the first N attempts, then FAILED
+        # so the job finalizes and stops being enumerated. A successful read
+        # clears the per-job counter.
+        unknown_counter = self._status_unknown_attempts()
+        try:
+            status = await provider.get_status(job_id)
+        except Exception as exc:
+            attempts = unknown_counter.get(job_id, 0) + 1
+            unknown_counter[job_id] = attempts
+            if attempts >= MAX_STATUS_UNKNOWN_ATTEMPTS:
+                logger.error(
+                    "🚨 get_status for training job %s failed %d times "
+                    "(provider likely lost its session after a restart); "
+                    "finalizing the job FAILED so it stops being enumerated. "
+                    "Last error: %s",
+                    job_id,
+                    attempts,
+                    exc,
+                )
+                unknown_counter.pop(job_id, None)
+                return WaitStatus(
+                    Outcome.FAILED,
+                    f"status unrecoverable for {job_id} after restart",
+                    data={
+                        "companion_id": companion_id,
+                        "job_id": job_id,
+                        "status_error": str(exc),
+                        "status_unknown_attempts": attempts,
+                    },
+                )
+            return WaitStatus(
+                Outcome.PENDING,
+                f"status unavailable for {job_id} (provider may have lost "
+                f"session after restart); retrying",
+                data={
+                    "companion_id": companion_id,
+                    "job_id": job_id,
+                    "status_error": str(exc),
+                    "status_unknown_attempts": attempts,
+                },
+            )
+        else:
+            # Successful read: clear any prior transient-unknown counter so a
+            # later (unrelated) failure starts its bounded retry afresh.
+            unknown_counter.pop(job_id, None)
 
         # Resolve terminal classification defensively. Prefer the host
         # TrainingState enum, but fall back to comparing the raw state value so
