@@ -104,6 +104,16 @@ class VisualIdentityFeature(Feature):
         self._lora_initialized = False
         self.db_pool = None  # Direct db_pool reference for companion lookups
 
+        # Idempotency guard for terminal training finalization. Both the
+        # blocking poll loop in ``_train_lora_for_companion`` AND the
+        # ``LoraTrainingWaitable`` provider can observe the same job reach a
+        # terminal state; finalization (avatar_config UPSERT + provider
+        # cleanup) must run its side effects EXACTLY ONCE per job so the GPU
+        # pod is torn down and the LoRA recorded without a double-cleanup.
+        # Best-effort across restarts (in-memory only); ``cleanup`` is wrapped
+        # in try/except so a repeat after a restart is harmless.
+        self._finalized_jobs: set[str] = set()
+
         # Enable feature if a training provider with generation capability exists
         # (e.g., local_mps can generate selfies without Replicate)
         if not self.enabled and TRAINING_FACTORY_AVAILABLE:
@@ -111,6 +121,20 @@ class VisualIdentityFeature(Feature):
             if gen_provider:
                 self.enabled = True
                 logger.info(f"VisualIdentityFeature enabled via generation provider: {gen_provider.provider_name}")
+
+    async def post_all_features_loaded(self, agent):
+        """Register the ``lora_train:`` Waitable provider with the wait engine.
+
+        Lets ``wait("lora_train:<companion_id>:<job_id>")`` dispatch here, and
+        lets a ``mode="signal"`` watch be reconciled by the host. The blocking
+        loop in :meth:`_train_lora_for_companion` does not depend on this
+        registration — both paths share :meth:`_finalize_training`.
+        """
+        from .wait_provider import LoraTrainingWaitable
+
+        registry = getattr(agent, "wait_registry", None)
+        if registry is not None:
+            registry.register(LoraTrainingWaitable(self), replace=True)
 
     def _ensure_lora_services(self) -> bool:
         """
@@ -766,55 +790,160 @@ Looking good! Want another one in a different style?"
             while elapsed < max_wait:
                 status = await self._training_provider.get_status(job.job_id)
 
-                if status.state == TrainingState.COMPLETED:
-                    # Determine lora_path based on provider
-                    lora_path = job.output_path or f"{job.provider}:{job.job_id}"
-                    logger.info(f"✅ Training completed: {lora_path}")
-
-                    # Update companion's avatar_config with LoRA info
-                    try:
-                        async with self.db_pool.acquire() as conn:
-                            await conn.execute("""
-                                UPDATE companions
-                                SET avatar_config = COALESCE(avatar_config, '{}'::jsonb) || $1::jsonb
-                                WHERE id = $2
-                            """, json.dumps({
-                                "lora_model_path": lora_path,
-                                "lora_training_status": "completed",
-                                "lora_trigger_word": job.trigger_word,
-                                "lora_provider": job.provider,
-                                "lora_job_id": job.job_id
-                            }), companion_id)
-                    except Exception as e:
-                        logger.error(f"Failed to update avatar_config: {e}")
-
-                    # Cleanup resources (important for session-based providers)
-                    await self._training_provider.cleanup(job.job_id)
-                    return lora_path
-
-                if status.state == TrainingState.FAILED:
-                    error = status.error or "Unknown error"
-                    logger.error(f"Training failed: {error}")
-                    await self._training_provider.cleanup(job.job_id)
-                    return None
-
-                if status.state == TrainingState.CANCELLED:
-                    logger.warning(f"Training was cancelled")
-                    await self._training_provider.cleanup(job.job_id)
-                    return None
+                if status.state in (
+                    TrainingState.COMPLETED,
+                    TrainingState.FAILED,
+                    TrainingState.CANCELLED,
+                ):
+                    # Terminal: finalize via the SINGLE idempotent path shared
+                    # with the LoraTrainingWaitable provider so the GPU pod is
+                    # always torn down and the LoRA recorded exactly once,
+                    # regardless of which path observes the terminal state.
+                    return await self._finalize_training(
+                        companion_id=companion_id,
+                        job_id=job.job_id,
+                        terminal_state=status.state,
+                        provider=job.provider,
+                        trigger_word=job.trigger_word,
+                        output_path=job.output_path,
+                        error=status.error,
+                    )
 
                 logger.info(f"⏳ Training progress: {status.progress*100:.0f}% ({status.state.value})")
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
 
             logger.error(f"Training timed out after {max_wait}s")
-            await self._training_provider.cancel(job.job_id)
-            await self._training_provider.cleanup(job.job_id)
-            return None
+            # Timeout is the loop giving up on a still-PENDING job. Cancel the
+            # remote job, then route through the shared finalizer (CANCELLED)
+            # so cleanup happens exactly once and is guard-protected.
+            try:
+                await self._training_provider.cancel(job.job_id)
+            except Exception as e:
+                logger.error(f"Failed to cancel timed-out job {job.job_id}: {e}")
+            return await self._finalize_training(
+                companion_id=companion_id,
+                job_id=job.job_id,
+                terminal_state=TrainingState.CANCELLED,
+                provider=job.provider,
+                trigger_word=job.trigger_word,
+                output_path=job.output_path,
+                error=f"Training timed out after {max_wait}s",
+            )
 
         except Exception as e:
             logger.error(f"LoRA training failed for {companion_id}: {e}", exc_info=True)
             return None
+
+    async def _finalize_training(
+        self,
+        companion_id: str,
+        job_id: str,
+        terminal_state: "TrainingState",
+        provider: Optional[str] = None,
+        trigger_word: Optional[str] = None,
+        output_path: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> Optional[str]:
+        """Run the terminal side effects for a training job EXACTLY ONCE.
+
+        This is the single finalization path reachable from BOTH the blocking
+        poll loop in :meth:`_train_lora_for_companion` and the
+        :class:`~kestrel_feature_visual.wait_provider.LoraTrainingWaitable`
+        provider. A naive Waitable that reports DONE without performing this
+        finalization would leave the GPU pod billing and the LoRA unpersisted;
+        funnelling both paths here guarantees the pod is torn down and the
+        LoRA recorded regardless of which observer sees the terminal state.
+
+        On DONE: compute ``lora_path``, merge LoRA metadata into the
+        companion's ``avatar_config`` (a jsonb merge that is naturally
+        idempotent), tear down provider resources, and return ``lora_path``.
+        On FAILED/CANCELLED: tear down resources and return ``None``.
+
+        Idempotency: an in-memory :attr:`_finalized_jobs` guard ensures a
+        double call (loop AND provider both seeing terminal) runs the side
+        effects once. The guard is best-effort across restarts; ``cleanup`` is
+        wrapped in try/except so a repeat after a restart (or after a session
+        was already torn down) is harmless rather than raising.
+
+        Args:
+            companion_id: Companion UUID to persist the LoRA against.
+            job_id: Provider job id (the cleanup/guard key).
+            terminal_state: The observed terminal :class:`TrainingState`.
+            provider: Provider name, for the ``lora_provider`` field and the
+                ``"{provider}:{job_id}"`` fallback path. May be ``None`` when
+                reconstructed from a status-only poll.
+            trigger_word: LoRA trigger word, persisted when known.
+            output_path: Provider output path, if known.
+            error: Failure/cancellation reason, for logging only.
+
+        Returns:
+            The LoRA path on success, else ``None``.
+        """
+        from kestrel_sovereign.features.training.types import TrainingState
+
+        # Idempotency guard: only the FIRST observer of a terminal job runs the
+        # side effects. ``cleanup`` is still exception-tolerant below so a
+        # post-restart repeat (guard reset to empty) cannot raise.
+        if job_id in self._finalized_jobs:
+            logger.debug(f"Training job {job_id} already finalized; skipping side effects")
+            if terminal_state == TrainingState.COMPLETED:
+                return output_path or (f"{provider}:{job_id}" if provider else None)
+            return None
+        self._finalized_jobs.add(job_id)
+
+        if terminal_state == TrainingState.COMPLETED:
+            lora_path = output_path or f"{provider}:{job_id}"
+            logger.info(f"✅ Training completed: {lora_path}")
+
+            # Update companion's avatar_config with LoRA info. The jsonb merge
+            # (COALESCE(...) || $1) is idempotent — repeating it overwrites the
+            # same keys with the same values.
+            if self.db_pool:
+                try:
+                    async with self.db_pool.acquire() as conn:
+                        await conn.execute("""
+                            UPDATE companions
+                            SET avatar_config = COALESCE(avatar_config, '{}'::jsonb) || $1::jsonb
+                            WHERE id = $2
+                        """, json.dumps({
+                            "lora_model_path": lora_path,
+                            "lora_training_status": "completed",
+                            "lora_trigger_word": trigger_word,
+                            "lora_provider": provider,
+                            "lora_job_id": job_id
+                        }), companion_id)
+                except Exception as e:
+                    logger.error(f"Failed to update avatar_config: {e}")
+            else:
+                logger.warning(
+                    f"No db_pool to persist LoRA for {companion_id}; job {job_id} finalized without persistence"
+                )
+
+            await self._safe_cleanup(job_id)
+            return lora_path
+
+        # FAILED / CANCELLED
+        if terminal_state == TrainingState.FAILED:
+            logger.error(f"Training failed: {error or 'Unknown error'}")
+        else:
+            logger.warning(f"Training was cancelled: {error or 'cancelled'}")
+        await self._safe_cleanup(job_id)
+        return None
+
+    async def _safe_cleanup(self, job_id: str) -> None:
+        """Tear down provider resources for ``job_id``, tolerating errors.
+
+        Wrapped so a session already torn down on a prior finalization (or
+        after a restart) cannot raise — finalization must be safe to repeat.
+        """
+        provider = self._training_provider
+        if provider is None:
+            return
+        try:
+            await provider.cleanup(job_id)
+        except Exception as e:
+            logger.warning(f"Cleanup for training job {job_id} failed (tolerated): {e}")
 
     @tool(
         name="train_lora",
