@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-feature-visual"
-version = "0.2.1"
+version = "0.2.2"
 description = "Visual identity for Kestrel Sovereign agents — avatar generation, selfies, and LoRA training for character consistency"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
