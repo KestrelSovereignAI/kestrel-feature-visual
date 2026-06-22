@@ -1191,3 +1191,35 @@ class TestTriggerWordKeyParity:
         assert cfg["lora_trigger_word"] == "TOKalice"
         # The generation-path key must also be set to the same value.
         assert cfg["trigger_word"] == "TOKalice"
+
+
+class TestFinalizeRetryPreservesPath:
+    """codex round 11: a finalize RETRY (cleanup failed first time) without
+    provider output details must NOT overwrite the already-persisted
+    lora_model_path with a provider:job_id sentinel."""
+
+    @pytest.mark.asyncio
+    async def test_retry_without_output_details_keeps_persisted_path(self):
+        TS = _training_state()
+        real_path = "gs://bucket/comp-1/pytorch_lora_weights.safetensors"
+        # Row already in 'finalizing' with the real path persisted (first pass
+        # completed but cleanup failed, leaving it finalizing).
+        db = FakeDbPool(rows={
+            "comp-1": {
+                "lora_training_status": "finalizing",
+                "lora_job_id": "job-9",
+                "lora_model_path": real_path,
+                "lora_trigger_word": "TOKalice",
+                "lora_provider": "fake_runpod",
+            },
+        })
+        # Status-only snapshot: COMPLETED but NO provider_details / output_path.
+        provider = FakeTrainingProvider([FakeStatus(TS.COMPLETED, provider_details={})])
+        feature = make_feature(provider, db)
+        w = LoraTrainingWaitable(feature)
+
+        status = await w.poll("comp-1:job-9")
+        assert status.outcome is Outcome.DONE
+        # The persisted real path must survive — NOT be clobbered by a sentinel.
+        assert db.conn.rows["comp-1"]["lora_model_path"] == real_path
+        assert "fake_runpod:job-9" not in str(db.conn.rows["comp-1"]["lora_model_path"])

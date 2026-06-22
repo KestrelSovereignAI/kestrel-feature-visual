@@ -1128,7 +1128,18 @@ Looking good! Want another one in a different style?"
                     trigger_word = recorded.get("lora_trigger_word")
                 if provider is None:
                     provider = recorded.get("lora_provider")
-                recorded_output_path = recorded.get("lora_output_path")
+                # Fall back to the dispatch-recorded output path, then to an
+                # ALREADY-PERSISTED lora_model_path. The latter matters on a
+                # finalize RETRY after a cleanup failure: the first COMPLETED
+                # pass persisted the real lora_model_path and left the row
+                # "finalizing"; a later status-only retry (no provider output
+                # details) must NOT let _resolve_lora_path fall through to the
+                # "provider:job_id" sentinel and overwrite that valid path
+                # (codex round 11). The persisted model path is authoritative.
+                recorded_output_path = (
+                    recorded.get("lora_output_path")
+                    or recorded.get("lora_model_path")
+                )
 
         # Serialize concurrent terminal observers of THIS job behind a per-job
         # lock so the check-then-add guard (with an awaited DB write between) is
