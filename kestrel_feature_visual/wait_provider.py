@@ -24,10 +24,12 @@ blocking path and this path together run the terminal side effects exactly
 once.
 
 Auto-wake: dispatch now records each in-flight job durably in the companion's
-``avatar_config`` (``lora_training_status="running"``), so this provider
-implements ``active_handles`` (making it a structural ``MonitorableWaitable``).
-The host reconciler enumerates those handles and wakes the agent when training
-completes even if no one explicitly waited. ``signal`` is still ``None`` because
+``avatar_config`` (``lora_training_status="running"``; a terminal-but-pending-
+cleanup job is ``"finalizing"``), so this provider implements ``active_handles``
+(making it a structural ``MonitorableWaitable``). The host reconciler enumerates
+both ``running`` AND ``finalizing`` handles and wakes the agent when training
+completes — and keeps re-polling a ``finalizing`` job so the finalizer retries
+pod teardown until it lands — even if no one explicitly waited. ``signal`` is still ``None`` because
 there is no terminal-state signal emitter for this kind yet; the reconciler
 classifies via ``poll``.
 """
@@ -96,21 +98,52 @@ class LoraTrainingWaitable:
         # while the job ran — polling the default backend would query the wrong
         # service and could fail or finalize with the wrong provider metadata.
         recorded_provider = await self._recorded_provider(companion_id)
-        provider = None
-        getter = getattr(self._feature, "_get_training_provider", None)
-        if callable(getter):
-            try:
-                provider = getter(recorded_provider) if recorded_provider else getter()
-            except Exception:
-                provider = None
-        if provider is None:
-            provider = getattr(self._feature, "_training_provider", None)
-        if provider is None:
-            return WaitStatus(
-                Outcome.FAILED,
-                "training provider unavailable",
-                data={"companion_id": companion_id, "job_id": job_id},
-            )
+
+        if recorded_provider:
+            # STRICT resolution for a RECORDED job (codex P2-A): we must only
+            # poll — and the finalizer must only finalize/clean up — against the
+            # exact backend the job ran on. ``_get_recorded_provider`` returns
+            # the provider ONLY if its ``provider_name`` matches; it NEVER falls
+            # back to the cached default. If the recorded backend can't be
+            # resolved right now (credentials/config absent), we DON'T poll a
+            # different service and wrongly mark the job terminal — we report
+            # PENDING so the reconciler retries when the right backend returns.
+            strict_getter = getattr(self._feature, "_get_recorded_provider", None)
+            provider = None
+            if callable(strict_getter):
+                try:
+                    provider = strict_getter(recorded_provider)
+                except Exception:
+                    provider = None
+            if provider is None:
+                return WaitStatus(
+                    Outcome.PENDING,
+                    f"recorded provider {recorded_provider} unavailable; will retry",
+                    data={
+                        "companion_id": companion_id,
+                        "job_id": job_id,
+                        "recorded_provider": recorded_provider,
+                    },
+                )
+        else:
+            # No recorded provider name (legacy/in-flight without metadata):
+            # fall back to the default backend via the lazy getter. There is no
+            # specific backend to be strict about here.
+            provider = None
+            getter = getattr(self._feature, "_get_training_provider", None)
+            if callable(getter):
+                try:
+                    provider = getter()
+                except Exception:
+                    provider = None
+            if provider is None:
+                provider = getattr(self._feature, "_training_provider", None)
+            if provider is None:
+                return WaitStatus(
+                    Outcome.FAILED,
+                    "training provider unavailable",
+                    data={"companion_id": companion_id, "job_id": job_id},
+                )
 
         status = await provider.get_status(job_id)
 
@@ -261,9 +294,13 @@ class LoraTrainingWaitable:
         """Enumerate in-flight training jobs as ``"<companion_id>:<job_id>"``.
 
         Reads the durable in-flight records dispatch writes into
-        ``companions.avatar_config`` (``lora_training_status="running"``) and
-        returns one handle per running job so the host reconciler can poll and
-        wake on completion without anyone having explicitly waited.
+        ``companions.avatar_config`` and returns one handle per job whose
+        ``lora_training_status`` is ``"running"`` OR ``"finalizing"`` so the
+        host reconciler can poll and wake on completion without anyone having
+        explicitly waited. ``"finalizing"`` jobs (terminal metadata persisted
+        but pod teardown not yet confirmed) stay enumerated so the reconciler
+        keeps re-polling and the finalizer retries cleanup until it lands
+        (codex P2-B) — never reporting DONE while the pod may still be billing.
 
         Cheap, side-effect-free, tolerant of a missing db_pool: returns ``[]``
         when nothing is in flight or no pool is configured.
@@ -277,7 +314,7 @@ class LoraTrainingWaitable:
             async with db_pool.acquire() as conn:
                 rows = await conn.fetch(
                     "SELECT id, avatar_config FROM companions "
-                    "WHERE avatar_config->>'lora_training_status' = 'running'"
+                    "WHERE avatar_config->>'lora_training_status' IN ('running', 'finalizing')"
                 )
         except Exception:
             return []

@@ -90,11 +90,14 @@ class FakeConn:
         return {"avatar_config": self.rows.get(companion_id)}
 
     async def fetch(self, sql, *params):
-        # SELECT id, avatar_config ... WHERE lora_training_status = 'running'
+        # SELECT id, avatar_config ... WHERE lora_training_status IN
+        # ('running', 'finalizing') — a 'finalizing' job (terminal metadata
+        # persisted, pod teardown not yet confirmed) stays enumerated so the
+        # reconciler keeps re-polling and cleanup is retried.
         out = []
         for cid, cfg in self.rows.items():
             cfg = cfg if isinstance(cfg, dict) else {}
-            if cfg.get("lora_training_status") == "running":
+            if cfg.get("lora_training_status") in ("running", "finalizing"):
                 out.append({"id": cid, "avatar_config": cfg})
         return out
 
@@ -125,13 +128,31 @@ def _training_state():
 
 
 def make_feature(provider, db_pool=None):
-    """Build a real VisualIdentityFeature wired to fakes (no initialize())."""
+    """Build a real VisualIdentityFeature wired to fakes (no initialize()).
+
+    Installs a STRICT ``_get_recorded_provider`` shim that resolves a recorded
+    provider name to ``provider`` ONLY when the name matches
+    ``provider.provider_name`` (mirroring the production strict-resolution
+    contract: never fall back to a different backend). The real
+    ``_get_recorded_provider`` goes through ``TrainingProviderFactory``, which
+    has no knowledge of the test fakes, so tests wire it here.
+    """
     from kestrel_feature_visual.feature import VisualIdentityFeature
 
     feature = VisualIdentityFeature(agent=None)
     feature._training_provider = provider
     feature.db_pool = db_pool
     feature._finalized_jobs = set()
+    feature._cleanup_attempts = {}
+
+    def strict_recorded(provider_name=None):
+        if not provider_name:
+            return None
+        if provider is not None and getattr(provider, "provider_name", None) == provider_name:
+            return provider
+        return None
+
+    feature._get_recorded_provider = strict_recorded
     return feature
 
 
@@ -184,9 +205,11 @@ class TestPollClassification:
 
         assert status.outcome is Outcome.DONE
         assert status.data["lora_path"] == "fake_runpod:job-9"
-        # finalize ran: cleanup + persistence
+        # finalize ran: cleanup + persistence. Two writes now: the intermediate
+        # "finalizing" (metadata persisted) then "completed" (committed after
+        # cleanup succeeds) — codex P2-B.
         assert provider.cleanup_calls == ["job-9"]
-        assert len(db.conn.executed) == 1
+        assert len(db.conn.executed) == 2
 
     @pytest.mark.asyncio
     async def test_failed_is_failed(self):
@@ -253,13 +276,16 @@ class TestPollClassification:
                        "lora_trigger_word": "TOK", "lora_provider": "vertex_ai"},
         })
         rebuilt = FakeTrainingProvider([FakeStatus(TS.COMPLETED)])
+        rebuilt.provider_name = "vertex_ai"  # rebuilt as the RECORDED backend
         feature = make_feature(None, db)  # simulate post-restart: no cached provider
 
-        def lazy_get(provider_name=None):
-            feature._training_provider = rebuilt
-            return rebuilt
+        def strict_rebuild(provider_name=None):
+            if provider_name == "vertex_ai":
+                feature._training_provider = rebuilt
+                return rebuilt
+            return None
 
-        feature._get_training_provider = lazy_get
+        feature._get_recorded_provider = strict_rebuild
         w = LoraTrainingWaitable(feature)
 
         status = await w.poll("comp-1:job-9")
@@ -318,9 +344,11 @@ class TestIdempotency:
         assert first.outcome is Outcome.DONE
         assert second.outcome is Outcome.DONE
         assert second.data["lora_path"] == "fake_runpod:job-9"
-        # ...but the side effects ran exactly once.
+        # ...but the side effects ran exactly once: cleanup once, and the
+        # two-phase write (finalizing + completed) happened on the FIRST poll
+        # only; the second poll hits the _finalized_jobs guard and writes nothing.
         assert provider.cleanup_calls == ["job-9"]
-        assert len(db.conn.executed) == 1
+        assert len(db.conn.executed) == 2
 
     @pytest.mark.asyncio
     async def test_finalize_direct_double_call_runs_once(self):
@@ -343,7 +371,9 @@ class TestIdempotency:
         assert p1 == "fake_runpod:job-9"
         assert p2 == "fake_runpod:job-9"
         assert provider.cleanup_calls == ["job-9"]
-        assert len(db.conn.executed) == 1
+        # First call: two-phase write (finalizing + completed). Second call hits
+        # the _finalized_jobs guard and writes nothing.
+        assert len(db.conn.executed) == 2
 
     @pytest.mark.asyncio
     async def test_cleanup_targets_recorded_provider_not_default(self):
@@ -356,12 +386,14 @@ class TestIdempotency:
         db = FakeDbPool()
         feature = make_feature(default_provider, db)
 
-        # Resolve "vertex_ai" to the recorded provider, anything else to default.
+        # Strictly resolve "vertex_ai" to the recorded provider; anything else
+        # (incl. the default's name) resolves to None — the strict resolver
+        # NEVER falls back to the cached default for a recorded job.
         def resolve(provider_name=None):
             if provider_name == "vertex_ai":
                 return recorded_provider
-            return default_provider
-        feature._get_training_provider = resolve
+            return None
+        feature._get_recorded_provider = resolve
 
         await feature._finalize_training(
             companion_id="comp-1", job_id="job-9",
@@ -397,6 +429,11 @@ class TestIdempotency:
         db.conn.execute = slow_execute
         provider = FakeTrainingProvider([FakeStatus(TS.COMPLETED)])
         feature = make_feature(provider, db)
+        # The job's recorded provider is "vertex_ai"; resolve it strictly to the
+        # fake so cleanup targets the right (only) backend.
+        feature._get_recorded_provider = lambda provider_name=None: (
+            provider if provider_name == "vertex_ai" else None
+        )
 
         r1, r2 = await asyncio.gather(
             feature._finalize_training(
@@ -499,11 +536,12 @@ class TestFinalizeMetadataCorrectness:
             }
         })
         provider = FakeTrainingProvider([FakeStatus(TS.COMPLETED)])
+        provider.provider_name = "vertex_ai"  # match the recorded backend (strict resolve)
         feature = make_feature(provider, db)
         w = LoraTrainingWaitable(feature)
 
-        # Provider name on the fake is "fake_runpod"; finalize keeps provider
-        # from the status path (non-None), trigger_word recovered from config.
+        # finalize keeps provider from the status path (non-None), trigger_word
+        # recovered from config.
         await w.poll("comp-1:job-9")
 
         cfg = db.conn.rows["comp-1"]
@@ -528,6 +566,7 @@ class TestFinalizeMetadataCorrectness:
                 "gcs_output_path": "gs://bucket/loras/comp-1/weights.safetensors"
             })
         ])
+        provider.provider_name = "vertex_ai"  # match the recorded backend (strict resolve)
         feature = make_feature(provider, db)
         w = LoraTrainingWaitable(feature)
 
@@ -574,6 +613,7 @@ class TestFinalizeMetadataCorrectness:
 
         db.conn.execute = flaky_execute
         provider = FakeTrainingProvider([FakeStatus(TS.COMPLETED)])
+        provider.provider_name = "vertex_ai"  # match the recorded backend (strict resolve)
         feature = make_feature(provider, db)
         w = LoraTrainingWaitable(feature)
 
@@ -644,6 +684,7 @@ class TestActiveHandles:
                        "lora_trigger_word": "TOK", "lora_provider": "vertex_ai"},
         })
         provider = FakeTrainingProvider([FakeStatus(TS.COMPLETED)])
+        provider.provider_name = "vertex_ai"  # match the recorded backend (strict resolve)
         feature = make_feature(provider, db)
         w = LoraTrainingWaitable(feature)
 
@@ -654,7 +695,8 @@ class TestActiveHandles:
     @pytest.mark.asyncio
     async def test_poll_uses_recorded_provider_not_default(self):
         """A persisted job must be polled on the provider it was dispatched on
-        (avatar_config.lora_provider), not the current default (codex P2)."""
+        (avatar_config.lora_provider), via the STRICT resolver — not the current
+        default (codex P2)."""
         TS = _training_state()
         db = FakeDbPool(rows={
             "comp-1": {"lora_training_status": "running", "lora_job_id": "job-9",
@@ -665,17 +707,23 @@ class TestActiveHandles:
 
         requested = []
 
-        def lazy_get(provider_name=None):
+        def strict_get(provider_name=None):
             requested.append(provider_name)
-            feature._training_provider = recorded
-            return recorded
+            if provider_name == "vastai":
+                return recorded
+            return None
 
-        feature._get_training_provider = lazy_get
+        feature._get_recorded_provider = strict_get
+        # The default getter must NOT be consulted for a recorded job; trip the
+        # test loudly if poll ever falls back to it.
+        def forbidden_default(provider_name=None):
+            raise AssertionError("recorded job must not use the default getter")
+        feature._get_training_provider = forbidden_default
         w = LoraTrainingWaitable(feature)
 
         await w.poll("comp-1:job-9")
 
-        # The getter was asked for the RECORDED provider, not the default.
+        # The STRICT resolver was asked for the RECORDED provider, not the default.
         assert requested == ["vastai"]
 
     def test_provider_is_structurally_monitorable(self):
@@ -740,3 +788,200 @@ class TestStateFallback:
         # the enum first; assert it is a recognizable completed marker.
         ts = finalize_calls[0]["terminal_state"]
         assert str(getattr(ts, "value", ts)) == "completed"
+
+
+# ---------------------------------------------------------------------------
+# codex P2-A: strict recorded-provider resolution — never poll/clean up the
+# WRONG backend. A recorded job whose backend resolves to a DIFFERENT
+# provider_name must NOT be polled or torn down against that backend; poll
+# reports PENDING and no cleanup runs (so the real pod keeps being retried, not
+# wrongly marked terminal while it bills).
+# ---------------------------------------------------------------------------
+
+class TestStrictRecordedProvider:
+    @pytest.mark.asyncio
+    async def test_poll_pending_when_recorded_provider_unavailable(self):
+        """Recorded job's backend can't be resolved right now -> poll returns
+        PENDING ('recorded provider ... unavailable'), no cleanup on any
+        backend, status stays running, job still enumerated."""
+        TS = _training_state()
+        db = FakeDbPool(rows={
+            "comp-1": {"lora_training_status": "running", "lora_job_id": "job-9",
+                       "lora_trigger_word": "TOK", "lora_provider": "vertex_ai"},
+        })
+        # A default/wrong-backend provider that WOULD report COMPLETED + clean up
+        # if (incorrectly) consulted. The strict resolver must never hand it back
+        # for a recorded "vertex_ai" job.
+        wrong = FakeTrainingProvider([FakeStatus(TS.COMPLETED)])
+        wrong.provider_name = "runpod"
+        feature = make_feature(wrong, db)
+        # Strict resolver cannot resolve "vertex_ai" (e.g. creds absent) -> None.
+        feature._get_recorded_provider = lambda provider_name=None: None
+        # If poll ever fell back to the default getter, it'd find the wrong pod.
+        feature._get_training_provider = lambda provider_name=None: wrong
+        w = LoraTrainingWaitable(feature)
+
+        status = await w.poll("comp-1:job-9")
+
+        assert status.outcome is Outcome.PENDING
+        assert "recorded provider vertex_ai unavailable" in status.summary
+        # No cleanup against the wrong backend, no terminal write.
+        assert wrong.cleanup_calls == []
+        assert wrong.get_status  # not consulted, but exists
+        assert db.conn.rows["comp-1"]["lora_training_status"] == "running"
+        assert "job-9" not in feature._finalized_jobs
+        assert await w.active_handles() == ["comp-1:job-9"]
+
+    @pytest.mark.asyncio
+    async def test_safe_cleanup_refuses_wrong_backend(self):
+        """_safe_cleanup must report failure (not clean up a different backend)
+        when the recorded provider name resolves to None — so the finalizer
+        leaves the job 'finalizing' and retries, never tearing down the wrong
+        pod (codex P2-A)."""
+        wrong = FakeTrainingProvider([])
+        wrong.provider_name = "runpod"
+        feature = make_feature(wrong, FakeDbPool())
+        feature._get_recorded_provider = lambda provider_name=None: None
+
+        ok = await feature._safe_cleanup("job-9", "vertex_ai")
+
+        assert ok is False
+        assert wrong.cleanup_calls == []
+
+
+# ---------------------------------------------------------------------------
+# codex P2-B: cleanup failure leaves the job 'finalizing' (still enumerated,
+# NOT guarded), and a later finalize retries cleanup until it succeeds. Bounded
+# by MAX_CLEANUP_ATTEMPTS so a permanently-erroring cleanup can't loop forever.
+# ---------------------------------------------------------------------------
+
+class TestFinalizingRetry:
+    @pytest.mark.asyncio
+    async def test_cleanup_failure_stays_finalizing_then_retry_succeeds(self):
+        TS = _training_state()
+        db = FakeDbPool(rows={
+            "comp-1": {"lora_training_status": "running", "lora_job_id": "job-9",
+                       "lora_trigger_word": "TOK", "lora_provider": "vertex_ai"},
+        })
+        provider = FakeTrainingProvider([FakeStatus(TS.COMPLETED)])
+        provider.provider_name = "vertex_ai"
+        # First cleanup attempt fails transiently; later attempts succeed.
+        state = {"fail": True}
+
+        async def flaky_cleanup(job_id):
+            provider.cleanup_calls.append(job_id)
+            if state["fail"]:
+                state["fail"] = False
+                raise RuntimeError("connection reset")
+        provider.cleanup = flaky_cleanup
+        feature = make_feature(provider, db)
+        w = LoraTrainingWaitable(feature)
+
+        # First poll: terminal observed, metadata persisted as "finalizing",
+        # cleanup FAILS -> stays finalizing, NOT in guard, still enumerated.
+        first = await w.poll("comp-1:job-9")
+        assert first.outcome is Outcome.PENDING  # finalization not yet committed
+        assert db.conn.rows["comp-1"]["lora_training_status"] == "finalizing"
+        assert db.conn.rows["comp-1"]["lora_model_path"] == "vertex_ai:job-9"
+        assert "job-9" not in feature._finalized_jobs
+        assert await w.active_handles() == ["comp-1:job-9"]
+        assert provider.cleanup_calls == ["job-9"]
+
+        # Second poll (reconciler retry): cleanup SUCCEEDS -> completed + guarded
+        # + dropped from active_handles.
+        second = await w.poll("comp-1:job-9")
+        assert second.outcome is Outcome.DONE
+        assert db.conn.rows["comp-1"]["lora_training_status"] == "completed"
+        assert "job-9" in feature._finalized_jobs
+        assert await w.active_handles() == []
+        assert provider.cleanup_calls == ["job-9", "job-9"]
+
+    @pytest.mark.asyncio
+    async def test_cleanup_failure_bounded_by_max_attempts(self):
+        """A permanently-erroring cleanup is capped: after MAX_CLEANUP_ATTEMPTS
+        failures the job is forced to its terminal status + guard (loud log),
+        instead of looping in 'finalizing' forever."""
+        from kestrel_feature_visual.feature import MAX_CLEANUP_ATTEMPTS
+
+        TS = _training_state()
+        db = FakeDbPool(rows={
+            "comp-1": {"lora_training_status": "running", "lora_job_id": "job-9",
+                       "lora_trigger_word": "TOK", "lora_provider": "vertex_ai"},
+        })
+        provider = FakeTrainingProvider([FakeStatus(TS.COMPLETED)])
+        provider.provider_name = "vertex_ai"
+
+        async def always_fail(job_id):
+            provider.cleanup_calls.append(job_id)
+            raise RuntimeError("permanent teardown error")  # not an "already gone" msg
+        provider.cleanup = always_fail
+        feature = make_feature(provider, db)
+        w = LoraTrainingWaitable(feature)
+
+        # Poll repeatedly. Up to the cap it stays finalizing/unguarded.
+        for i in range(MAX_CLEANUP_ATTEMPTS - 1):
+            s = await w.poll("comp-1:job-9")
+            assert s.outcome is Outcome.PENDING
+            assert db.conn.rows["comp-1"]["lora_training_status"] == "finalizing"
+            assert "job-9" not in feature._finalized_jobs
+
+        # The MAX-th attempt forces terminal + guard despite cleanup still erroring.
+        final = await w.poll("comp-1:job-9")
+        assert final.outcome is Outcome.DONE
+        assert db.conn.rows["comp-1"]["lora_training_status"] == "completed"
+        assert "job-9" in feature._finalized_jobs
+        assert await w.active_handles() == []
+        assert len(provider.cleanup_calls) == MAX_CLEANUP_ATTEMPTS
+
+    @pytest.mark.asyncio
+    async def test_cleanup_already_gone_treated_as_success(self):
+        """An 'already gone' cleanup error means the pod is already torn down ->
+        treat as success so we don't loop forever on an already-clean pod."""
+        TS = _training_state()
+        db = FakeDbPool(rows={
+            "comp-1": {"lora_training_status": "running", "lora_job_id": "job-9",
+                       "lora_trigger_word": "TOK", "lora_provider": "vertex_ai"},
+        })
+        provider = FakeTrainingProvider([FakeStatus(TS.COMPLETED)])
+        provider.provider_name = "vertex_ai"
+        provider.cleanup_raises = True  # raises "session already torn down"
+        feature = make_feature(provider, db)
+        w = LoraTrainingWaitable(feature)
+
+        status = await w.poll("comp-1:job-9")
+
+        assert status.outcome is Outcome.DONE
+        assert db.conn.rows["comp-1"]["lora_training_status"] == "completed"
+        assert "job-9" in feature._finalized_jobs
+
+    @pytest.mark.asyncio
+    async def test_failed_job_cleanup_failure_stays_finalizing(self):
+        """FAILED terminal follows the same shape: finalizing -> (on cleanup
+        success) failed + guard; on cleanup failure stays finalizing."""
+        TS = _training_state()
+        db = FakeDbPool(rows={
+            "comp-1": {"lora_training_status": "running", "lora_job_id": "job-9",
+                       "lora_provider": "vertex_ai"},
+        })
+        provider = FakeTrainingProvider([FakeStatus(TS.FAILED, error="boom")])
+        provider.provider_name = "vertex_ai"
+        state = {"fail": True}
+
+        async def flaky_cleanup(job_id):
+            provider.cleanup_calls.append(job_id)
+            if state["fail"]:
+                state["fail"] = False
+                raise RuntimeError("connection reset")
+        provider.cleanup = flaky_cleanup
+        feature = make_feature(provider, db)
+        w = LoraTrainingWaitable(feature)
+
+        first = await w.poll("comp-1:job-9")
+        assert first.outcome is Outcome.PENDING
+        assert db.conn.rows["comp-1"]["lora_training_status"] == "finalizing"
+        assert "job-9" not in feature._finalized_jobs
+
+        second = await w.poll("comp-1:job-9")
+        assert second.outcome is Outcome.FAILED
+        assert db.conn.rows["comp-1"]["lora_training_status"] == "failed"
+        assert "job-9" in feature._finalized_jobs

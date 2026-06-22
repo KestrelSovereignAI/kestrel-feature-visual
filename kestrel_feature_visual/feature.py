@@ -56,6 +56,18 @@ except ImportError:
 # ImageGenerationService requires platform integration
 IMAGE_SERVICE_AVAILABLE = False
 
+# Bound the "finalizing" (pending-cleanup) retry loop. A job whose terminal
+# metadata is persisted but whose pod teardown keeps failing transiently stays
+# in ``lora_training_status="finalizing"`` and is re-polled/re-finalized so
+# cleanup is retried until it lands. If cleanup keeps erroring for this many
+# attempts we force the job to its terminal status + guard and log loudly,
+# rather than re-polling a permanently-erroring cleanup forever (mirrors the
+# core reconciler's MAX_DELIVERY_ATTEMPTS philosophy). The pod may then still be
+# billing, but that is surfaced as a loud error instead of a silent infinite
+# loop — and a permanently-erroring cleanup almost always means the pod is
+# already gone / unreachable anyway.
+MAX_CLEANUP_ATTEMPTS = 5
+
 
 class VisualIdentityFeature(Feature):
     """
@@ -122,6 +134,13 @@ class VisualIdentityFeature(Feature):
         # asyncio.Lock so concurrent first-observers create exactly one per job.
         self._finalize_locks: Dict[str, "asyncio.Lock"] = {}
         self._finalize_locks_guard = asyncio.Lock()
+
+        # Per-job cleanup-attempt counter for the "finalizing" retry loop. A job
+        # whose terminal metadata is persisted but whose pod teardown keeps
+        # failing stays in ``lora_training_status="finalizing"`` and is re-polled
+        # so cleanup is retried. We cap the retries (MAX_CLEANUP_ATTEMPTS) to
+        # avoid an infinite finalizing loop on a permanently-erroring cleanup.
+        self._cleanup_attempts: Dict[str, int] = {}
 
         # Enable feature if a training provider with generation capability exists
         # (e.g., local_mps can generate selfies without Replicate)
@@ -211,6 +230,42 @@ class VisualIdentityFeature(Feature):
                 logger.info(f"✅ Using training provider: {self._training_provider.provider_name}")
 
         return self._training_provider
+
+    def _get_recorded_provider(self, provider_name: Optional[str]):
+        """STRICTLY resolve a job's RECORDED backend by name.
+
+        Unlike :meth:`_get_training_provider`, this NEVER falls back to the
+        cached default. A recorded job (one we are polling / finalizing /
+        cleaning up) must only ever be touched against the exact backend it was
+        dispatched on. If the named provider can't be resolved to a provider
+        whose ``provider_name`` matches (credentials/config not present right
+        now), return ``None`` — the caller then treats the situation as
+        "can't determine yet" and retries later, rather than polling or
+        tearing down the WRONG backend (codex P2): a Vertex/Vast job must never
+        be cleaned up against RunPod (the default), wrongly marked terminal
+        while the real pod keeps billing.
+
+        Returns the provider ONLY if ``provider.provider_name == provider_name``,
+        else ``None``.
+        """
+        if not provider_name:
+            return None
+        if not TRAINING_FACTORY_AVAILABLE:
+            return None
+        try:
+            provider = TrainingProviderFactory.get_provider(provider_name)
+        except Exception as e:
+            logger.warning(f"⚠️ Recorded provider '{provider_name}' resolution raised: {e}")
+            return None
+        if provider is None:
+            return None
+        if getattr(provider, "provider_name", None) != provider_name:
+            logger.warning(
+                f"⚠️ Recorded provider '{provider_name}' resolved to "
+                f"'{getattr(provider, 'provider_name', None)}'; refusing to use the wrong backend"
+            )
+            return None
+        return provider
 
     async def _generate_with_provider(
         self,
@@ -1120,46 +1175,115 @@ Looking good! Want another one in a different style?"
             )
             logger.info(f"✅ Training completed: {lora_path}")
 
-            # Update companion's avatar_config with LoRA info. The jsonb merge
-            # (COALESCE(...) || $1) is idempotent. Build the merge dict
+            # Persist the LoRA metadata AND set an INTERMEDIATE
+            # ``lora_training_status="finalizing"`` — NOT "completed" yet — and
+            # do NOT add the job to ``_finalized_jobs`` (codex P2-B). The
+            # terminal "completed" status + guard are only set AFTER cleanup
+            # SUCCEEDS, so a job whose pod teardown fails transiently stays
+            # enumerated by active_handles (which now also matches "finalizing")
+            # and is re-polled → cleanup retried, instead of being marked
+            # terminal while the pod keeps billing.
+            #
+            # The jsonb merge (COALESCE(...) || $1) is idempotent. Build it
             # CONDITIONALLY: only include keys whose values are non-None so a
             # missing trigger_word/provider never overwrites the value recorded
             # at dispatch.
             merge: Dict[str, Any] = {
                 "lora_model_path": lora_path,
-                "lora_training_status": "completed",
+                "lora_training_status": "finalizing",
                 "lora_trigger_word": trigger_word,
                 "lora_provider": provider,
                 "lora_job_id": job_id,
             }
             persisted = await self._persist_terminal_status(companion_id, job_id, merge)
-            # Only mark finalized when the terminal status actually landed (or
-            # there is no db_pool to land it in). On a transient DB failure we
-            # leave the row ``running`` AND the guard empty so the reconciler /
-            # a later poll retries the whole terminal sequence — otherwise the
-            # job would be enumerated by active_handles forever, never persisted.
-            if persisted:
-                self._finalized_jobs.add(job_id)
-            # Cleanup is idempotent; run it so the pod is torn down (stop billing)
-            # even if a later retry re-runs it. Use the RECORDED provider so a
-            # restart / non-default backend still tears down the right pod.
-            await self._safe_cleanup(job_id, provider)
+            # On a transient DB failure we leave the row ``running`` AND the
+            # guard empty so the reconciler / a later poll retries the whole
+            # terminal sequence — otherwise the job would be enumerated by
+            # active_handles forever, never persisted.
+            if not persisted:
+                return lora_path
+            await self._cleanup_then_commit_terminal(
+                companion_id=companion_id,
+                job_id=job_id,
+                provider=provider,
+                terminal_status="completed",
+            )
             return lora_path
 
-        # FAILED / CANCELLED: mark the job terminal so it is no longer enumerated
-        # as in-flight by active_handles, then tear down resources.
+        # FAILED / CANCELLED: same shape — set an intermediate "finalizing"
+        # status (carrying the eventual failed/cancelled), run cleanup, and only
+        # on cleanup SUCCESS commit the terminal status + guard.
         terminal_status = "failed" if terminal_state == TrainingState.FAILED else "cancelled"
         if terminal_state == TrainingState.FAILED:
             logger.error(f"Training failed: {error or 'Unknown error'}")
         else:
             logger.warning(f"Training was cancelled: {error or 'cancelled'}")
         persisted = await self._persist_terminal_status(
-            companion_id, job_id, {"lora_training_status": terminal_status}
+            companion_id, job_id, {"lora_training_status": "finalizing"}
         )
-        if persisted:
-            self._finalized_jobs.add(job_id)
-        await self._safe_cleanup(job_id, provider)
+        if not persisted:
+            return None
+        await self._cleanup_then_commit_terminal(
+            companion_id=companion_id,
+            job_id=job_id,
+            provider=provider,
+            terminal_status=terminal_status,
+        )
         return None
+
+    async def _cleanup_then_commit_terminal(
+        self,
+        companion_id: str,
+        job_id: str,
+        provider: Optional[str],
+        terminal_status: str,
+    ) -> None:
+        """Run cleanup; on SUCCESS commit the terminal status + finalized guard.
+
+        Implements the codex P2-B contract: a job's terminal status (and the
+        ``_finalized_jobs`` guard that blocks re-finalization) is committed ONLY
+        once the GPU pod teardown actually lands, so a transient cleanup failure
+        leaves the job in ``"finalizing"`` — still enumerated by
+        :meth:`active_handles`, still polled, cleanup retried — rather than being
+        reported terminal while the pod keeps billing.
+
+        To avoid an infinite finalizing loop on a permanently-erroring cleanup,
+        attempts are capped at :data:`MAX_CLEANUP_ATTEMPTS`; once exceeded we
+        force the terminal status + guard and log loudly (mirrors the core
+        reconciler's MAX_DELIVERY_ATTEMPTS philosophy).
+        """
+        cleaned = await self._safe_cleanup(job_id, provider)
+        if cleaned:
+            persisted = await self._persist_terminal_status(
+                companion_id, job_id, {"lora_training_status": terminal_status}
+            )
+            if persisted:
+                self._finalized_jobs.add(job_id)
+                self._cleanup_attempts.pop(job_id, None)
+            return
+
+        # Cleanup failed transiently. Count the attempt; leave status
+        # "finalizing" and the guard empty so the next poll retries — UNLESS we
+        # have exhausted the cap, in which case force terminal + guard.
+        attempts = self._cleanup_attempts.get(job_id, 0) + 1
+        self._cleanup_attempts[job_id] = attempts
+        if attempts >= MAX_CLEANUP_ATTEMPTS:
+            logger.error(
+                f"🚨 Cleanup for training job {job_id} failed {attempts} times; "
+                f"forcing status '{terminal_status}' and giving up on teardown. "
+                f"The provider pod may STILL BE BILLING — manual teardown required."
+            )
+            persisted = await self._persist_terminal_status(
+                companion_id, job_id, {"lora_training_status": terminal_status}
+            )
+            if persisted:
+                self._finalized_jobs.add(job_id)
+                self._cleanup_attempts.pop(job_id, None)
+        else:
+            logger.warning(
+                f"Cleanup for training job {job_id} failed (attempt {attempts}/"
+                f"{MAX_CLEANUP_ATTEMPTS}); job left 'finalizing' for retry"
+            )
 
     async def _persist_terminal_status(
         self, companion_id: str, job_id: str, merge: Dict[str, Any]
@@ -1191,26 +1315,63 @@ Looking good! Want another one in a different style?"
 
     async def _safe_cleanup(
         self, job_id: str, provider_name: Optional[str] = None
-    ) -> None:
-        """Tear down provider resources for ``job_id``, tolerating errors.
+    ) -> bool:
+        """Tear down provider resources for ``job_id``; report success.
 
-        Cleans up the provider the job actually RAN on — resolved from its
-        recorded ``provider_name`` — not the cached default. After a restart,
-        or when the default differs from the job's backend (codex P1), cleaning
-        up ``self._training_provider`` could skip teardown or hit the wrong
-        backend and leave the real GPU pod/session billing. ``_get_training_provider``
-        returns the specific backend when a name is given.
+        Cleans up the provider the job actually RAN on — resolved STRICTLY from
+        its recorded ``provider_name`` via :meth:`_get_recorded_provider`, which
+        NEVER falls back to the cached default (codex P2-A). Tearing down a
+        Vertex/Vast job against RunPod (the default) would mark it terminal
+        while the real pod keeps billing, so if the recorded backend can't be
+        resolved right now we DON'T clean up a different backend — we report
+        failure so the finalizer leaves the job "finalizing" and retries when
+        the right backend/credentials return.
 
-        Wrapped so a session already torn down on a prior finalization (or
-        after a restart) cannot raise — finalization must be safe to repeat.
+        Returns:
+            ``True`` when teardown succeeded or there was nothing to tear down
+            (no provider name recorded → no pod to clean; or the session was
+            already gone). ``False`` on a transient failure — the recorded
+            backend is currently unresolvable, or ``cleanup`` raised — so the
+            caller leaves the job "finalizing" and retries.
         """
-        provider = self._get_training_provider(provider_name)
+        # No recorded provider name → no specific pod to tear down. There is
+        # nothing to clean up against, so this is a successful no-op rather than
+        # a reason to loop forever in "finalizing".
+        if not provider_name:
+            return True
+
+        provider = self._get_recorded_provider(provider_name)
         if provider is None:
-            return
+            # Recorded backend not resolvable right now (credentials/config
+            # absent, or it resolves to a DIFFERENT provider_name). Do NOT clean
+            # up the wrong backend — report failure so we retry later.
+            logger.warning(
+                f"Cleanup for training job {job_id} deferred: recorded provider "
+                f"'{provider_name}' unavailable; will retry"
+            )
+            return False
         try:
             await provider.cleanup(job_id)
+            return True
         except Exception as e:
-            logger.warning(f"Cleanup for training job {job_id} failed (tolerated): {e}")
+            # A session already torn down on a prior finalization (or after a
+            # restart) must not strand the job: treat an "already gone" error as
+            # success so we don't loop forever on an already-clean pod. The
+            # provider exposes no structured "already gone" signal, so we sniff
+            # the message; otherwise treat the exception as a transient failure
+            # to retry (bounded by MAX_CLEANUP_ATTEMPTS in the finalizer).
+            msg = str(e).lower()
+            if any(
+                marker in msg
+                for marker in ("already", "not found", "no such", "does not exist", "gone")
+            ):
+                logger.info(
+                    f"Cleanup for training job {job_id}: pod already gone "
+                    f"({e}); treating as success"
+                )
+                return True
+            logger.warning(f"Cleanup for training job {job_id} failed (will retry): {e}")
+            return False
 
     @tool(
         name="train_lora",
