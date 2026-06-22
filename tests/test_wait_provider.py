@@ -346,6 +346,34 @@ class TestIdempotency:
         assert len(db.conn.executed) == 1
 
     @pytest.mark.asyncio
+    async def test_cleanup_targets_recorded_provider_not_default(self):
+        """codex P1: finalize must tear down the provider the job RAN on, not
+        the cached default — else a restart / non-default backend leaves the
+        real pod billing."""
+        TS = _training_state()
+        default_provider = FakeTrainingProvider([FakeStatus(TS.COMPLETED)])
+        recorded_provider = FakeTrainingProvider([FakeStatus(TS.COMPLETED)])
+        db = FakeDbPool()
+        feature = make_feature(default_provider, db)
+
+        # Resolve "vertex_ai" to the recorded provider, anything else to default.
+        def resolve(provider_name=None):
+            if provider_name == "vertex_ai":
+                return recorded_provider
+            return default_provider
+        feature._get_training_provider = resolve
+
+        await feature._finalize_training(
+            companion_id="comp-1", job_id="job-9",
+            terminal_state=TS.COMPLETED, provider="vertex_ai",
+            trigger_word="TOK", output_path=None,
+        )
+
+        # The job's actual backend was cleaned up; the cached default was NOT.
+        assert recorded_provider.cleanup_calls == ["job-9"]
+        assert default_provider.cleanup_calls == []
+
+    @pytest.mark.asyncio
     async def test_concurrent_terminal_observers_run_side_effects_once(self):
         """Two coroutines observing the same job terminal AT ONCE must still run
         persistence + cleanup exactly once — the per-job lock makes the

@@ -1141,8 +1141,9 @@ Looking good! Want another one in a different style?"
             if persisted:
                 self._finalized_jobs.add(job_id)
             # Cleanup is idempotent; run it so the pod is torn down (stop billing)
-            # even if a later retry re-runs it.
-            await self._safe_cleanup(job_id)
+            # even if a later retry re-runs it. Use the RECORDED provider so a
+            # restart / non-default backend still tears down the right pod.
+            await self._safe_cleanup(job_id, provider)
             return lora_path
 
         # FAILED / CANCELLED: mark the job terminal so it is no longer enumerated
@@ -1157,7 +1158,7 @@ Looking good! Want another one in a different style?"
         )
         if persisted:
             self._finalized_jobs.add(job_id)
-        await self._safe_cleanup(job_id)
+        await self._safe_cleanup(job_id, provider)
         return None
 
     async def _persist_terminal_status(
@@ -1188,13 +1189,22 @@ Looking good! Want another one in a different style?"
             logger.error(f"Failed to persist terminal status for {companion_id} (job {job_id}): {e}")
             return False
 
-    async def _safe_cleanup(self, job_id: str) -> None:
+    async def _safe_cleanup(
+        self, job_id: str, provider_name: Optional[str] = None
+    ) -> None:
         """Tear down provider resources for ``job_id``, tolerating errors.
+
+        Cleans up the provider the job actually RAN on — resolved from its
+        recorded ``provider_name`` — not the cached default. After a restart,
+        or when the default differs from the job's backend (codex P1), cleaning
+        up ``self._training_provider`` could skip teardown or hit the wrong
+        backend and leave the real GPU pod/session billing. ``_get_training_provider``
+        returns the specific backend when a name is given.
 
         Wrapped so a session already torn down on a prior finalization (or
         after a restart) cannot raise — finalization must be safe to repeat.
         """
-        provider = self._training_provider
+        provider = self._get_training_provider(provider_name)
         if provider is None:
             return
         try:
