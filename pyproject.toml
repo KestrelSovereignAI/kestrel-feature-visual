@@ -32,6 +32,14 @@ classifiers = [
     "Topic :: Multimedia :: Graphics",
 ]
 dependencies = [
+    # The no-LoRA reference-image route populates companion-context fields
+    # (companion_id/companion_did/scene/avatar_reference_url/...) on
+    # GenerationConfig. These land natively in a later SDK; until then
+    # ``_build_generation_config`` sets them forward-compatibly as attributes
+    # (see feature.py), so the route works against SDKs that predate the
+    # fields. Queue providers read those attributes directly rather than via
+    # ``to_dict()``, so an older SDK's serializer dropping them is not a
+    # correctness risk for the enqueue path.
     "kestrel-sovereign-sdk>=0.25.0,<1",
     "httpx>=0.27.0",
     "replicate>=1.0.4",
@@ -44,7 +52,15 @@ test = [
     # Integration tests touch kestrel_sovereign.features.training (lazy
     # provider factory the feature uses at runtime). Pinning the
     # framework here keeps the integration test self-contained.
-    "kestrel-sovereign>=0.13.1,<1",
+    #
+    # >=0.46.0 is required for entry-point training-provider discovery
+    # (kestrel-sovereign #2445): it's what lets a queue-based, no-LoRA
+    # provider (frinz #558 CatalogWorkerProvider) register via the
+    # ``kestrel_sovereign.training_providers`` entry point and be resolved
+    # by the no-LoRA reference-image route. On older cores that discovery
+    # doesn't exist, so no reference-capable provider is ever found and the
+    # route stays dormant (falls back to training) rather than mis-firing.
+    "kestrel-sovereign>=0.46.0,<1",
 ]
 
 [project.urls]
