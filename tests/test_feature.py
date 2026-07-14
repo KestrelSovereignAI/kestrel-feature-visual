@@ -329,7 +329,12 @@ class TestNoLoraReferenceRoute:
     @pytest.mark.asyncio
     async def test_no_lora_routes_to_reference_provider(self, feature_standalone):
         """No LoRA + supports_reference_image provider → generate_image(config)
-        with companion_id / avatar_reference_url / scene populated."""
+        with companion_id / avatar_reference_url / scene populated.
+
+        Mocks _lookup_avatar_url so the SSRF-guarded route uses a
+        server-owned URL rather than the caller-supplied reference_image
+        (codex round-2 P1: unresolvable / private-host caller URLs are
+        rejected by _reference_url_is_safe)."""
         feature = feature_standalone
         feature.enabled = True
         feature.db_pool = None  # no existing LoRA lookup
@@ -338,10 +343,14 @@ class TestNoLoraReferenceRoute:
         feature._get_training_provider = lambda *a, **k: provider
         feature._ensure_lora_services = lambda: False
 
+        async def _fake_lookup(_cid):
+            return "https://avatar.example/a.png"
+
+        feature._lookup_avatar_url = _fake_lookup
+
         result = await feature.generate_selfie(
             scene="beach",
             companion_id="comp-123",
-            reference_image="https://avatar.example/a.png",
             allow_training=False,
         )
 
@@ -425,10 +434,16 @@ class TestNoLoraReferenceRoute:
         feature._get_training_provider = lambda *a, **k: provider
         feature._ensure_lora_services = lambda: False
 
+        # See test_no_lora_routes_to_reference_provider for why we mock the
+        # server-owned URL lookup instead of relying on caller-supplied
+        # reference_image (codex round-2 P1 SSRF guard).
+        async def _fake_lookup(_cid):
+            return "https://avatar.example/a.png"
+        feature._lookup_avatar_url = _fake_lookup
+
         result = await feature.generate_selfie(
             scene="beach",
             companion_id="comp-123",
-            reference_image="https://avatar.example/a.png",
             allow_training=False,
         )
 
@@ -501,6 +516,78 @@ class TestNoLoraReferenceRoute:
         assert result.status is ToolResultStatus.ERROR
         assert result.data.get("needs_training") is True
         assert provider.generate_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_caller_reference_url_rejected_when_no_stored_avatar(
+        self, feature_standalone
+    ):
+        """Codex round-2 P1 SSRF regression: when the companion has no
+        server-owned avatar and the caller-supplied reference_image is not
+        SSRF-safe (unresolvable / private-host / non-http), the no-LoRA
+        route MUST NOT dispatch to the provider. Otherwise a caller can
+        aim the queue worker at localhost / 169.254.169.254 / RFC1918."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = None
+
+        provider = _FakeProvider("catalog_worker", supports_reference_image=True)
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        async def _no_stored(_cid):
+            return None
+        feature._lookup_avatar_url = _no_stored
+
+        # Rogue URL: http scheme, private-host, would SSRF the worker.
+        result = await feature.generate_selfie(
+            scene="casual",
+            companion_id="comp-123",
+            reference_image="http://169.254.169.254/latest/meta-data/",
+            allow_training=False,
+        )
+
+        # Falls through to the LoRA-required error (needs_training) rather
+        # than dispatching to the provider.
+        assert result.status is ToolResultStatus.ERROR
+        assert provider.generate_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_tenant_boundary_refuses_mismatched_companion_id(
+        self, feature_standalone
+    ):
+        """Codex round-2 P1 tenant regression: when the agent has a bound
+        companion_context, a tool-call companion_id that doesn't match must
+        be refused before any avatar / did lookup fires — otherwise a
+        caller can drive selfie generation and vault-write against another
+        user's companion."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = None
+
+        # Simulate a per-companion agent binding.
+        class _Agent:
+            companion_context = {
+                "companion_id": "bound-owner-id",
+                "user_id": "user-1",
+            }
+        feature.agent = _Agent()
+
+        # If the tenant guard fails, the code path would try to look up
+        # avatar/DID and possibly dispatch. Blow up loudly if that happens.
+        async def _boom(*_a, **_k):
+            raise AssertionError("tenant guard bypassed — lookup fired")
+        feature._lookup_avatar_url = _boom
+        feature._lookup_companion_did = _boom
+
+        result = await feature.generate_selfie(
+            scene="casual",
+            companion_id="attacker-supplied-different-id",
+            allow_training=False,
+        )
+
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data.get("code") == "companion_id_mismatch"
+        assert result.data.get("status_code") == 403
 
 
 # =============================================================================
