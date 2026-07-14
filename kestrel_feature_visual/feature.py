@@ -352,6 +352,305 @@ class VisualIdentityFeature(Feature):
             logger.error(f"Provider generation failed: {e}")
             raise RuntimeError(str(e))
 
+    def _provider_capabilities(self, provider):
+        """Resolve a provider's :class:`ProviderCapabilities`, if any.
+
+        Prefers a ``capabilities`` attribute the provider declares itself
+        (queue-based providers like frinz's ``CatalogWorkerProvider`` register
+        via the ``kestrel_sovereign.training_providers`` entry point and expose
+        their own capabilities), falling back to the factory's static table
+        keyed on ``provider_name`` for the built-in adapters.
+        """
+        if provider is None:
+            return None
+        caps = getattr(provider, "capabilities", None)
+        if caps is not None:
+            return caps
+        if TRAINING_FACTORY_AVAILABLE:
+            name = getattr(provider, "provider_name", None)
+            if name:
+                try:
+                    return TrainingProviderFactory.get_capabilities(name)
+                except Exception:  # pragma: no cover - defensive
+                    return None
+        return None
+
+    def _provider_supports_reference_image(self, provider) -> bool:
+        """True if ``provider`` self-declares ``supports_reference_image``.
+
+        None-safe: providers/SDKs that predate the flag report False, so the
+        no-LoRA reference-image route is only taken by providers that opt in
+        (e.g. a PuLID/avatar queue worker), never the LoRA-only adapters.
+        """
+        caps = self._provider_capabilities(provider)
+        if caps is None:
+            return False
+        return bool(getattr(caps, "supports_reference_image", False))
+
+    def _get_reference_image_provider(self, provider_name: Optional[str] = None):
+        """Resolve a provider that can generate without a LoRA from a reference.
+
+        Checks the explicitly-requested / default training provider first, then
+        any generation-capable provider the factory knows about, returning the
+        first that declares ``supports_reference_image=True``. Returns ``None``
+        when no reference-image-capable provider is available (callers then fall
+        back to the existing ``allow_training`` behavior).
+        """
+        candidates = []
+        provider = self._get_training_provider(provider_name)
+        if provider is not None:
+            candidates.append(provider)
+        if TRAINING_FACTORY_AVAILABLE:
+            try:
+                gen_provider = TrainingProviderFactory.get_generation_provider()
+            except Exception:  # pragma: no cover - defensive
+                gen_provider = None
+            if gen_provider is not None:
+                candidates.append(gen_provider)
+        for candidate in candidates:
+            if self._provider_supports_reference_image(candidate):
+                return candidate
+        return None
+
+    @staticmethod
+    def _build_generation_config(
+        *,
+        prompt: str,
+        lora_path: Optional[str] = None,
+        trigger_word: str = "TOK",
+        num_outputs: int = 1,
+        companion_id: Optional[str] = None,
+        companion_did: Optional[str] = None,
+        scene: Optional[str] = None,
+        avatar_reference_url: Optional[str] = None,
+        requested_by: Optional[str] = None,
+        engine_hint: Optional[str] = None,
+    ) -> "GenerationConfig":
+        """Build a ``GenerationConfig`` carrying companion context.
+
+        Forward-compatible: newer SDKs accept the companion-context fields
+        (``companion_id``/``scene``/``avatar_reference_url``/…) directly on the
+        constructor; older ones don't, so we set them as attributes instead.
+        Either way the resulting config exposes them for a queue-based provider
+        to consume.
+        """
+        context = {
+            "companion_id": companion_id,
+            "companion_did": companion_did,
+            "scene": scene,
+            "avatar_reference_url": avatar_reference_url,
+            "requested_by": requested_by,
+            "engine_hint": engine_hint,
+        }
+        try:
+            config = GenerationConfig(
+                prompt=prompt,
+                lora_path=lora_path,
+                trigger_word=trigger_word,
+                num_outputs=num_outputs,
+                **{k: v for k, v in context.items() if v is not None},
+            )
+        except TypeError:
+            config = GenerationConfig(
+                prompt=prompt,
+                lora_path=lora_path,
+                trigger_word=trigger_word,
+                num_outputs=num_outputs,
+            )
+        # Older SDKs lack the companion-context fields entirely; make sure they
+        # are present (defaulting to None) so downstream code can always read
+        # them regardless of the installed SDK version.
+        for key, value in context.items():
+            if not hasattr(config, key):
+                setattr(config, key, value)
+        return config
+
+    async def _lookup_avatar_url(self, companion_id: str) -> Optional[str]:
+        """Look up a companion's avatar image URL for use as an identity anchor.
+
+        Prefers the ``image_url`` column, falling back to any avatar URL stored
+        in ``avatar_config``. The fallback order mirrors Frinz's REST selfie
+        endpoint (the source of truth for the PuLID-avatar queue path):
+        ``avatar_config["url"]`` → ``image_url`` → ``avatar_url``. Companions
+        created by the wizard store their reference under ``url``; dropping that
+        key would route them to the queue with ``avatar_reference_url=None``.
+        Returns ``None`` when unavailable.
+        """
+        if not self.db_pool or not companion_id:
+            return None
+        try:
+            async with self.db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT image_url, avatar_config FROM companions WHERE id = $1",
+                    companion_id,
+                )
+            if not row:
+                return None
+            image_url = row.get("image_url")
+            if image_url:
+                return image_url
+            raw_config = row.get("avatar_config")
+            if raw_config:
+                config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
+                return (
+                    config.get("url")
+                    or config.get("image_url")
+                    or config.get("avatar_url")
+                    or config.get("reference_image_url")
+                )
+        except Exception as e:
+            logger.warning(f"Failed to look up avatar url for {companion_id}: {e}")
+        return None
+
+    async def _lookup_companion_did(self, companion_id: str) -> Optional[str]:
+        """Look up a companion's DID for provider attribution / vault writes.
+
+        The queue-based PuLID-avatar worker (frinz #558) writes generated
+        images into the companion's vault keyed on its ``did``; without the DID
+        the enqueue path can't attribute the write. The no-LoRA route therefore
+        carries it through on the ``GenerationConfig``. Returns ``None`` when
+        unavailable (no db_pool, missing row, or DB error).
+        """
+        if not self.db_pool or not companion_id:
+            return None
+        try:
+            async with self.db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT did FROM companions WHERE id = $1",
+                    companion_id,
+                )
+            if not row:
+                return None
+            return row.get("did")
+        except Exception as e:
+            logger.warning(f"Failed to look up did for {companion_id}: {e}")
+        return None
+
+    async def _generate_via_reference_image(
+        self,
+        *,
+        provider,
+        prompt: str,
+        scene: str,
+        companion_id: Optional[str],
+        avatar_reference_url: Optional[str],
+        companion_did: Optional[str] = None,
+        requested_by: Optional[str] = None,
+        num_outputs: int = 1,
+    ) -> ToolResult:
+        """No-LoRA route: dispatch to a reference-image-capable provider.
+
+        Builds a ``GenerationConfig`` populated with the companion context a
+        queue-based worker consumes (``companion_id`` / ``companion_did`` /
+        ``scene`` / ``avatar_reference_url``) and calls
+        ``provider.generate_image(config)``. No LoRA and no forced training.
+
+        Handles both provider shapes:
+
+        * **Synchronous** providers return a terminal ``completed`` result with
+          the generated ``images`` — returned as a finished selfie.
+        * **Queue-based** providers (e.g. frinz's ``CatalogWorkerProvider``)
+          *accept* the job and return a non-terminal result (``pending`` /
+          ``generating``) carrying a ``job_id`` but no image yet. That is a
+          SUCCESSFUL async enqueue, not a failure, so it returns
+          ``ToolResult.ok(data={"queued": True, "job_id": ...})``. Only a
+          ``failed`` state — or a non-terminal result with no ``job_id`` handle
+          to poll — is treated as an error.
+        """
+        config = self._build_generation_config(
+            prompt=prompt,
+            lora_path=None,
+            num_outputs=num_outputs,
+            companion_id=companion_id,
+            companion_did=companion_did,
+            scene=scene,
+            avatar_reference_url=avatar_reference_url,
+            requested_by=requested_by,
+            engine_hint="pulid-avatar",
+        )
+
+        backend = getattr(provider, "provider_name", "provider")
+        logger.info(
+            f"🎨 Generating no-LoRA reference-image selfie via {backend} "
+            f"(companion={companion_id}, scene={scene})"
+        )
+
+        try:
+            result = await provider.generate_image(config)
+        except GenerationError as e:
+            logger.error(f"Reference-image generation failed: {e}")
+            return ToolResult.failed(str(e), data={"companion_id": companion_id})
+        except Exception as e:
+            logger.error(f"Reference-image generation error: {e}")
+            return ToolResult.failed(str(e), data={"companion_id": companion_id})
+
+        state = getattr(result, "state", None)
+        state_value = getattr(state, "value", None)
+        images = getattr(result, "images", None) or []
+        job_id = getattr(result, "job_id", None)
+
+        # Terminal success: image is ready now (synchronous provider).
+        if state_value == "completed":
+            if not images:
+                return ToolResult.failed(
+                    "Generation completed but no images returned",
+                    data={"companion_id": companion_id},
+                )
+            logger.info(f"✅ Generated reference-image selfie via {backend}")
+            return ToolResult.ok(
+                confirmation=f"Generated selfie (scene: {scene}, reference-image identity)",
+                data={
+                    "image_url": images[0],
+                    "scene": scene,
+                    "prompt": prompt,  # for gallery storage
+                    "used_lora": False,
+                    "trained_this_request": False,
+                    "reference_used": True,
+                    "queued": False,
+                    "avatar_reference_url": avatar_reference_url,
+                    "backend": backend,
+                    "elapsed_seconds": getattr(result, "elapsed_seconds", None),
+                },
+            )
+
+        # Terminal failure.
+        if state_value == "failed":
+            return ToolResult.failed(
+                f"Generation failed: {getattr(result, 'error', None) or 'Unknown error'}",
+                data={"companion_id": companion_id},
+            )
+
+        # Non-terminal (pending / generating / loading): a queue-based provider
+        # accepted the job. As long as we got a job handle back, this is a
+        # successful async enqueue — the image lands out-of-band later.
+        if job_id:
+            logger.info(
+                f"✅ Queued reference-image selfie via {backend} "
+                f"(job_id={job_id}, state={state_value})"
+            )
+            return ToolResult.ok(
+                confirmation=f"Queued selfie (scene: {scene}, reference-image identity)",
+                data={
+                    "queued": True,
+                    "job_id": job_id,
+                    "status": state_value,
+                    "scene": scene,
+                    "prompt": prompt,  # for gallery storage
+                    "used_lora": False,
+                    "trained_this_request": False,
+                    "reference_used": True,
+                    "avatar_reference_url": avatar_reference_url,
+                    "backend": backend,
+                    "companion_id": companion_id,
+                },
+            )
+
+        # Non-terminal with no image AND no job handle to poll → nothing usable.
+        return ToolResult.failed(
+            f"Generation failed: {getattr(result, 'error', None) or 'Unknown error'}",
+            data={"companion_id": companion_id},
+        )
+
     def set_db_pool(self, db_pool):
         """Set the database pool for companion lookups."""
         self.db_pool = db_pool
@@ -438,15 +737,23 @@ Looking good! Want another one in a different style?"
         provider: Optional[str] = None,
     ) -> ToolResult:
         """
-        Generate a selfie of the companion. REQUIRES LoRA - no censored fallback.
+        Generate a selfie of the companion.
 
-        If companion has a trained LoRA model, uses Vast.ai/RunPod with FLUX.1-dev.
-        If no LoRA exists and allow_training=True, triggers lazy training (~15-20 min first time).
-        If no LoRA exists and allow_training=False, FAILS - we don't fall back to censored models.
+        Resolution order:
+        - If a trained LoRA is available, uses Vast.ai/RunPod with FLUX.1-dev
+          (character-consistent, unchanged).
+        - Else if the resolved provider declares ``supports_reference_image``
+          (e.g. a PuLID/avatar queue worker), routes there with the companion
+          context (companion_id, scene, avatar_reference_url) — no LoRA, no
+          forced training.
+        - Else if allow_training=True, triggers lazy training (~15-20 min first time).
+        - Else FAILS - we don't fall back to censored models.
 
         Args:
             scene: Style of photo (casual, portrait, glamour, flirty, cozy, adventure, mysterious, romantic, playful, dreamy, confident)
-            reference_image: Ignored (kept for API compatibility)
+            reference_image: Optional avatar/identity reference URL for the
+                no-LoRA (PuLID) route. Falls back to the companion's stored
+                avatar when omitted. Ignored on the LoRA path.
             companion_id: Companion UUID for LoRA lookup (required for selfies)
             lora_model_path: Direct path to LoRA model (optional, overrides lookup)
             style: Art style (photorealistic, anime, artistic)
@@ -537,7 +844,17 @@ Looking good! Want another one in a different style?"
             has_provider = self._get_training_provider() is not None
             has_legacy_services = self._ensure_lora_services()
 
-            if lora_model_path or (companion_id and (has_provider or has_legacy_services)):
+            # A provider that can generate WITHOUT a LoRA from a reference image
+            # (PuLID/avatar identity anchor) — e.g. a queue-based worker. Resolved
+            # up front so the no-LoRA route is reachable even when the default
+            # training provider can't be used.
+            reference_provider = self._get_reference_image_provider(provider)
+            has_reference_provider = reference_provider is not None
+
+            if lora_model_path or (
+                companion_id
+                and (has_provider or has_legacy_services or has_reference_provider)
+            ):
                 # If no direct path provided, look up or train
                 if not lora_model_path and companion_id:
                     # First check for existing LoRA (get full info including IPFS CID)
@@ -553,6 +870,44 @@ Looking good! Want another one in a different style?"
                             logger.info(f"Found IPFS CID for LoRA: {lora_ipfs_cid[:16]}...")
                         if flux_version:
                             logger.info(f"Using FLUX version from DB: {flux_version}")
+                    elif has_reference_provider and (
+                        avatar_reference_url := (
+                            reference_image
+                            or await self._lookup_avatar_url(companion_id)
+                        )
+                    ):
+                        # =====================================================
+                        # NO-LoRA ROUTE: reference-image / PuLID-avatar provider
+                        # =====================================================
+                        # No trained LoRA, but the resolved provider can anchor
+                        # identity on the companion's avatar. Route straight to
+                        # it with the companion context (companion_id,
+                        # companion_did, scene, avatar_reference_url) — no forced
+                        # ~15-min training. Guarded on avatar_reference_url: with
+                        # no identity anchor the PuLID worker has nothing to
+                        # reference, so we fall through to training/fail instead
+                        # of enqueuing an unrouteable job.
+                        reference_prompt = (
+                            base_prompt.replace("A photo of TRIGGER_WORD, ", "A photo of ")
+                            .replace("TRIGGER_WORD, ", "")
+                            .replace("TRIGGER_WORD", "")
+                            .strip()
+                        )
+                        companion_did = await self._lookup_companion_did(companion_id)
+                        requested_by = None
+                        if self.agent and hasattr(self.agent, "companion_context"):
+                            requested_by = getattr(
+                                self.agent, "companion_context", {}
+                            ).get("user_id")
+                        return await self._generate_via_reference_image(
+                            provider=reference_provider,
+                            prompt=reference_prompt,
+                            scene=scene,
+                            companion_id=companion_id,
+                            avatar_reference_url=avatar_reference_url,
+                            companion_did=companion_did,
+                            requested_by=requested_by,
+                        )
                     elif allow_training:
                         # No existing LoRA - train one (this takes 15-20 min)
                         lora_model_path = await self._get_or_train_lora(companion_id)
