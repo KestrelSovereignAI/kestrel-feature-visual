@@ -23,12 +23,55 @@ Lazy Training Flow:
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
+import socket
 from typing import Dict, Any, Optional
+from urllib.parse import urlparse
 
 import httpx
+
+
+def _reference_url_is_safe(url: str) -> bool:
+    """True if a caller-supplied reference-image URL is safe to dispatch.
+
+    The no-LoRA route forwards this URL to a downstream provider or queue
+    worker that fetches the image. Without validation an authenticated
+    caller could aim the fetch at localhost / 169.254.169.254 / RFC1918
+    hosts and turn this endpoint into an SSRF probe (codex round-2 P1 on
+    kf-visual #9). Providers may or may not apply their own SSRF filters,
+    so we do it here at the boundary.
+
+    Fail-closed on any parse / DNS ambiguity.
+    """
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    if not parsed.hostname:
+        return False
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, None)
+    except Exception:
+        return False
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return False
+        if (
+            ip.is_loopback or ip.is_link_local or ip.is_private
+            or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+        ):
+            return False
+    return True
 
 from kestrel_sdk.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
@@ -396,17 +439,38 @@ class VisualIdentityFeature(Feature):
         when no reference-image-capable provider is available (callers then fall
         back to the existing ``allow_training`` behavior).
         """
+        # Codex round-2 P2: don't stop at the top-priority provider. If the
+        # highest-priority generator is LoRA-only (no supports_reference_image),
+        # a lower-priority reference-capable provider (e.g. frinz's
+        # CatalogWorkerProvider) would be silently skipped and the request
+        # would fall through to training. Iterate every available provider.
+        seen_names: set = set()
         candidates = []
         provider = self._get_training_provider(provider_name)
         if provider is not None:
             candidates.append(provider)
+            seen_names.add(getattr(provider, "provider_name", None))
         if TRAINING_FACTORY_AVAILABLE:
             try:
                 gen_provider = TrainingProviderFactory.get_generation_provider()
             except Exception:  # pragma: no cover - defensive
                 gen_provider = None
-            if gen_provider is not None:
+            if gen_provider is not None and getattr(gen_provider, "provider_name", None) not in seen_names:
                 candidates.append(gen_provider)
+                seen_names.add(getattr(gen_provider, "provider_name", None))
+            # Enumerate every available provider so a lower-priority
+            # reference-capable one is still reachable when a LoRA-only
+            # generator outranks it.
+            try:
+                for name in TrainingProviderFactory.list_available_providers():
+                    if name in seen_names:
+                        continue
+                    p = TrainingProviderFactory.get_provider(name)
+                    if p is not None:
+                        candidates.append(p)
+                        seen_names.add(name)
+            except Exception:  # pragma: no cover - defensive
+                pass
         for candidate in candidates:
             if self._provider_supports_reference_image(candidate):
                 return candidate
@@ -780,6 +844,29 @@ Looking good! Want another one in a different style?"
             if companion_id:
                 logger.info(f"Auto-filled companion_id from agent context: {companion_id}")
 
+        # Codex round-2 P1: tenant-boundary check. A tool-call caller can
+        # pass ANY companion UUID; without pinning to the active
+        # companion_context, they could drive generation and vault-write
+        # against another user's companion. Refuse when the supplied ID
+        # doesn't match the agent's bound context. companion_context is
+        # host-set (agent instances are per-companion), so this pin is
+        # authoritative for the multi-tenant chat path. Callers without
+        # an agent context (batch jobs / admin scripts) are unaffected —
+        # they're already trusted server-side callers by construction.
+        if companion_id and self.agent and hasattr(self.agent, "companion_context"):
+            ctx = getattr(self.agent, "companion_context", {}) or {}
+            bound_id = ctx.get("companion_id")
+            if bound_id and str(companion_id) != str(bound_id):
+                logger.warning(
+                    "generate_selfie companion_id=%s does not match agent "
+                    "companion_context=%s — refusing to cross tenant boundary",
+                    companion_id, bound_id,
+                )
+                return ToolResult.failed(
+                    "companion_id does not match the active companion context",
+                    data={"code": "companion_id_mismatch", "status_code": 403},
+                )
+
         scene = scene.lower()
         scene_description = self.SCENE_PROMPTS.get(scene, self.SCENE_PROMPTS["casual"])
 
@@ -871,9 +958,22 @@ Looking good! Want another one in a different style?"
                         if flux_version:
                             logger.info(f"Using FLUX version from DB: {flux_version}")
                     elif has_reference_provider and (
+                        # Codex round-2 P1: prefer the SERVER-owned avatar URL
+                        # (server-generated during wizard / adoption). Only
+                        # fall back to the caller-supplied `reference_image`
+                        # when the companion has no stored avatar AND the
+                        # supplied URL passes an SSRF-safe check (public
+                        # https, non-private host). Without this a caller
+                        # could aim the queue worker at localhost or
+                        # 169.254.169.254 metadata endpoints via the
+                        # unvalidated `reference_image` sink.
                         avatar_reference_url := (
-                            reference_image
-                            or await self._lookup_avatar_url(companion_id)
+                            await self._lookup_avatar_url(companion_id)
+                            or (
+                                reference_image
+                                if _reference_url_is_safe(reference_image)
+                                else None
+                            )
                         )
                     ):
                         # =====================================================
