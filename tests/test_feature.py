@@ -552,6 +552,95 @@ class TestNoLoraReferenceRoute:
         assert provider.generate_calls == 0
 
     @pytest.mark.asyncio
+    async def test_allow_training_true_prefers_training_over_reference(
+        self, feature_standalone
+    ):
+        """Issue #13: an explicit ``allow_training=True`` opt-in must win over
+        the no-LoRA reference-image route. A reference-capable provider is
+        registered AND a server-owned avatar URL is available, but the caller
+        asked to train — so we route to training, NOT the reference provider.
+
+        Uses the REAL lazy-dispatch return shape: ``_get_or_train_lora``
+        returns a ``training:<job_id>`` handle (not finished weights). That
+        handle must NOT be fed into generation; the tool returns a queued
+        result and never calls the provider's generate_image."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = None  # no existing LoRA lookup
+
+        provider = _FakeProvider("catalog_worker", supports_reference_image=True)
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        # A resolvable server-owned avatar so the reference route would fire if
+        # the allow_training precedence were not honored.
+        async def _fake_lookup(_cid):
+            return "https://avatar.example/a.png"
+        feature._lookup_avatar_url = _fake_lookup
+
+        trained = {"called": False}
+
+        async def _fake_train(cid):
+            trained["called"] = True
+            # Real lazy dispatch: a newly started job returns an in-flight
+            # handle, not a usable LoRA path.
+            return "training:job-abc"
+        feature._get_or_train_lora = _fake_train
+
+        result = await feature.generate_selfie(
+            scene="beach",
+            companion_id="comp-123",
+            allow_training=True,
+        )
+
+        assert result.status is ToolResultStatus.OK
+        # Training was dispatched, reference provider was NOT used as a route.
+        assert trained["called"] is True
+        # The queued job handle is surfaced, not treated as ready weights.
+        assert result.data["training_queued"] is True
+        assert result.data["training_job_id"] == "job-abc"
+        assert result.data["used_lora"] is False
+        assert result.data["trained_this_request"] is False
+        # No image was produced and generation was NEVER called with the
+        # in-flight handle as a lora_path.
+        assert "image_url" not in result.data
+        assert provider.generate_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_allow_training_false_keeps_reference_route(
+        self, feature_standalone
+    ):
+        """Issue #13 counterpart: with ``allow_training=False`` the
+        reference-image route is still selected (regression guard)."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = None
+
+        provider = _FakeProvider("catalog_worker", supports_reference_image=True)
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        async def _fake_lookup(_cid):
+            return "https://avatar.example/a.png"
+        feature._lookup_avatar_url = _fake_lookup
+
+        # Training must NOT be attempted on the reference route.
+        async def _boom_train(_cid):
+            raise AssertionError("training fired on the reference route")
+        feature._get_or_train_lora = _boom_train
+
+        result = await feature.generate_selfie(
+            scene="beach",
+            companion_id="comp-123",
+            allow_training=False,
+        )
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["reference_used"] is True
+        assert result.data["used_lora"] is False
+        assert provider.received_config.lora_path is None
+
+    @pytest.mark.asyncio
     async def test_tenant_boundary_refuses_mismatched_companion_id(
         self, feature_standalone
     ):

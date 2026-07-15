@@ -806,11 +806,14 @@ Looking good! Want another one in a different style?"
         Resolution order:
         - If a trained LoRA is available, uses Vast.ai/RunPod with FLUX.1-dev
           (character-consistent, unchanged).
+        - Else if allow_training=True, triggers lazy training (~15-20 min first
+          time). An explicit training opt-in wins over the reference-image
+          route (issue #13): a caller asking for a real LoRA must not be
+          silently downgraded to a PuLID reference-image job.
         - Else if the resolved provider declares ``supports_reference_image``
           (e.g. a PuLID/avatar queue worker), routes there with the companion
           context (companion_id, scene, avatar_reference_url) — no LoRA, no
           forced training.
-        - Else if allow_training=True, triggers lazy training (~15-20 min first time).
         - Else FAILS - we don't fall back to censored models.
 
         Args:
@@ -938,9 +941,20 @@ Looking good! Want another one in a different style?"
             reference_provider = self._get_reference_image_provider(provider)
             has_reference_provider = reference_provider is not None
 
+            # Issue #13: an explicit training opt-in (``allow_training=True``,
+            # the caller saying "take the ~15 min, train me a real LoRA") must
+            # take precedence over the no-LoRA reference-image route. The
+            # reference provider therefore only counts toward selection when
+            # training was NOT requested — both for entering this block and for
+            # winning below. Otherwise a caller who asked for training would be
+            # silently downgraded to a PuLID reference-image job.
             if lora_model_path or (
                 companion_id
-                and (has_provider or has_legacy_services or has_reference_provider)
+                and (
+                    has_provider
+                    or has_legacy_services
+                    or (has_reference_provider and not allow_training)
+                )
             ):
                 # If no direct path provided, look up or train
                 if not lora_model_path and companion_id:
@@ -957,7 +971,10 @@ Looking good! Want another one in a different style?"
                             logger.info(f"Found IPFS CID for LoRA: {lora_ipfs_cid[:16]}...")
                         if flux_version:
                             logger.info(f"Using FLUX version from DB: {flux_version}")
-                    elif has_reference_provider and (
+                    elif has_reference_provider and not allow_training and (
+                        # Issue #13: only take the no-LoRA reference route when
+                        # the caller did NOT opt into training. allow_training=True
+                        # falls through to the training branch below.
                         # Codex round-2 P1: prefer the SERVER-owned avatar URL
                         # (server-generated during wizard / adoption). Only
                         # fall back to the caller-supplied `reference_image`
@@ -1009,12 +1026,48 @@ Looking good! Want another one in a different style?"
                             requested_by=requested_by,
                         )
                     elif allow_training:
-                        # No existing LoRA - train one (this takes 15-20 min)
-                        lora_model_path = await self._get_or_train_lora(companion_id)
-                        if lora_model_path and not lora_model_path.startswith("existing:"):
+                        # No existing LoRA - lazily dispatch training (~15-20 min).
+                        lora_result = await self._get_or_train_lora(companion_id)
+                        if lora_result and lora_result.startswith("existing:"):
+                            # A LoRA turned out to exist after all — strip the
+                            # sentinel and generate with it right now.
+                            lora_model_path = lora_result.replace("existing:", "", 1)
+                        elif lora_result and lora_result.startswith("training:"):
+                            # Lazy dispatch: ``_get_or_train_lora`` returned an
+                            # in-flight job handle (``training:<job_id>``), NOT
+                            # usable LoRA weights. It must NOT be passed to
+                            # generation as a ``lora_path`` — the worker would be
+                            # asked to render against a LoRA that does not exist
+                            # yet. Return a queued result instead so the caller
+                            # (or the reconciler) can poll/finalize and re-request
+                            # the selfie once real weights land.
+                            training_job_id = lora_result.replace("training:", "", 1)
+                            logger.info(
+                                f"LoRA training queued for companion "
+                                f"{companion_id}: job {training_job_id} — selfie "
+                                "deferred until weights land"
+                            )
+                            return ToolResult.ok(
+                                confirmation=(
+                                    f"LoRA training started for companion "
+                                    f"{companion_id} (job {training_job_id}). "
+                                    "This takes ~15-20 min; request the selfie "
+                                    "again once training completes."
+                                ),
+                                data={
+                                    "training_queued": True,
+                                    "training_job_id": training_job_id,
+                                    "companion_id": companion_id,
+                                    "scene": scene,
+                                    "used_lora": False,
+                                    "trained_this_request": False,
+                                },
+                            )
+                        elif lora_result:
+                            # Direct usable path (no sentinel) — e.g. a provider
+                            # that trains synchronously and returns real weights.
+                            lora_model_path = lora_result
                             trained_this_request = True
-                        elif lora_model_path and lora_model_path.startswith("existing:"):
-                            lora_model_path = lora_model_path.replace("existing:", "")
                     else:
                         # No LoRA and not allowed to train - FAIL LOUD
                         return ToolResult.failed(
