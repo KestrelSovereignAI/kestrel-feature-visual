@@ -799,6 +799,7 @@ Looking good! Want another one in a different style?"
         style: str = "photorealistic",
         allow_training: bool = True,
         provider: Optional[str] = None,
+        requested_by: Optional[str] = None,
     ) -> ToolResult:
         """
         Generate a selfie of the companion.
@@ -823,6 +824,12 @@ Looking good! Want another one in a different style?"
             style: Art style (photorealistic, anime, artistic)
             allow_training: If True and no LoRA, train one. If False and no LoRA, fail.
             provider: Force specific provider (runpod, vertex_ai, vastai). None = auto-select.
+            requested_by: Authenticated user id to attribute the job to. Set by
+                REST callers (which have no agent.companion_context); propagated
+                into ``GenerationConfig.requested_by`` on the no-LoRA route so a
+                queue-based provider records the real user id instead of a
+                sentinel. When omitted, falls back to the agent context's
+                ``user_id`` on the chat path.
 
         Returns:
             ``ToolResult.ok(confirmation, data={image_url, scene, used_lora,
@@ -994,8 +1001,14 @@ Looking good! Want another one in a different style?"
                             .strip()
                         )
                         companion_did = await self._lookup_companion_did(companion_id)
-                        requested_by = None
-                        if self.agent and hasattr(self.agent, "companion_context"):
+                        # Prefer an explicit REST-supplied user id; fall back to
+                        # the agent context's user_id on the chat path. This is
+                        # what lets a REST caller (no agent.companion_context)
+                        # attribute the queued job to the authenticated user so
+                        # the dashboard's requested_by-scoped poll can find it.
+                        if not requested_by and self.agent and hasattr(
+                            self.agent, "companion_context"
+                        ):
                             requested_by = getattr(
                                 self.agent, "companion_context", {}
                             ).get("user_id")
