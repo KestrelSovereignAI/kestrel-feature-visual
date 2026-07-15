@@ -552,6 +552,113 @@ class TestNoLoraReferenceRoute:
         assert provider.generate_calls == 0
 
     @pytest.mark.asyncio
+    async def test_explicit_requested_by_reaches_provider_config(
+        self, feature_standalone
+    ):
+        """REST path: an explicit ``requested_by`` propagates into the
+        provider's ``GenerationConfig.requested_by`` (issue #12). Frinz's
+        REST endpoint passes the authenticated user id here so the
+        dashboard's requested_by-scoped poll can find the queued job."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = None
+
+        provider = _FakeProvider("catalog_worker", supports_reference_image=True)
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        async def _fake_lookup(_cid):
+            return "https://avatar.example/a.png"
+        feature._lookup_avatar_url = _fake_lookup
+
+        result = await feature.generate_selfie(
+            scene="beach",
+            companion_id="comp-123",
+            allow_training=False,
+            requested_by="user-1",
+        )
+
+        assert result.status is ToolResultStatus.OK
+        assert provider.generate_calls == 1
+        assert provider.received_config.requested_by == "user-1"
+
+    @pytest.mark.asyncio
+    async def test_chat_path_auto_fills_requested_by_from_agent_context(
+        self, feature_standalone
+    ):
+        """Regression: chat path with no explicit ``requested_by`` still
+        auto-fills it from the agent's companion_context user_id."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = None
+
+        class _Agent:
+            companion_context = {
+                "companion_id": "comp-123",
+                "user_id": "ctx-user-7",
+            }
+        feature.agent = _Agent()
+
+        provider = _FakeProvider("catalog_worker", supports_reference_image=True)
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        async def _fake_lookup(_cid):
+            return "https://avatar.example/a.png"
+        feature._lookup_avatar_url = _fake_lookup
+
+        result = await feature.generate_selfie(
+            scene="beach",
+            companion_id="comp-123",
+            allow_training=False,
+        )
+
+        assert result.status is ToolResultStatus.OK
+        assert provider.generate_calls == 1
+        assert provider.received_config.requested_by == "ctx-user-7"
+
+    @pytest.mark.asyncio
+    async def test_agent_context_wins_over_tool_supplied_requested_by(
+        self, feature_standalone
+    ):
+        """Codex round-2 P1 on #12: ``generate_selfie`` is an @tool so every
+        kwarg is LLM-controllable via prompt injection. When an agent context
+        is bound, tool-supplied ``requested_by`` MUST be ignored — otherwise a
+        prompt-injected chat message could attribute the queued job to another
+        user (cross-tenant leak: their dashboard's requested_by-scoped poll
+        would then find it). Only the standalone REST path (no agent context)
+        honors the explicit kwarg."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = None
+
+        class _Agent:
+            companion_context = {
+                "companion_id": "comp-123",
+                "user_id": "ctx-user-7",
+            }
+        feature.agent = _Agent()
+
+        provider = _FakeProvider("catalog_worker", supports_reference_image=True)
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        async def _fake_lookup(_cid):
+            return "https://avatar.example/a.png"
+        feature._lookup_avatar_url = _fake_lookup
+
+        result = await feature.generate_selfie(
+            scene="beach",
+            companion_id="comp-123",
+            allow_training=False,
+            requested_by="attacker-supplied-other-user",
+        )
+
+        assert result.status is ToolResultStatus.OK
+        # Agent context wins; the attacker-supplied value is ignored.
+        assert provider.received_config.requested_by == "ctx-user-7"
+
+    @pytest.mark.asyncio
     async def test_tenant_boundary_refuses_mismatched_companion_id(
         self, feature_standalone
     ):

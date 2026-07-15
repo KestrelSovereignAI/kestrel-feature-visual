@@ -799,6 +799,7 @@ Looking good! Want another one in a different style?"
         style: str = "photorealistic",
         allow_training: bool = True,
         provider: Optional[str] = None,
+        requested_by: Optional[str] = None,
     ) -> ToolResult:
         """
         Generate a selfie of the companion.
@@ -823,6 +824,12 @@ Looking good! Want another one in a different style?"
             style: Art style (photorealistic, anime, artistic)
             allow_training: If True and no LoRA, train one. If False and no LoRA, fail.
             provider: Force specific provider (runpod, vertex_ai, vastai). None = auto-select.
+            requested_by: Authenticated user id to attribute the job to. Set by
+                REST callers (which have no agent.companion_context); propagated
+                into ``GenerationConfig.requested_by`` on the no-LoRA route so a
+                queue-based provider records the real user id instead of a
+                sentinel. When omitted, falls back to the agent context's
+                ``user_id`` on the chat path.
 
         Returns:
             ``ToolResult.ok(confirmation, data={image_url, scene, used_lora,
@@ -994,11 +1001,24 @@ Looking good! Want another one in a different style?"
                             .strip()
                         )
                         companion_did = await self._lookup_companion_did(companion_id)
-                        requested_by = None
-                        if self.agent and hasattr(self.agent, "companion_context"):
+                        # Tenant-scoping precedence (codex round-2 P1 on #12):
+                        # `generate_selfie` is an @tool, so every kwarg is
+                        # LLM-controllable via prompt injection. If we let a
+                        # caller-supplied `requested_by` win when an agent
+                        # context is bound, a prompt-injected chat message
+                        # could attribute the queued job to another user's
+                        # ID and let that user's dashboard poll find it —
+                        # cross-tenant job leak. So: when self.agent has a
+                        # companion_context (chat path), we ALWAYS use its
+                        # user_id and IGNORE any tool-supplied
+                        # requested_by. Only the standalone REST path (no
+                        # agent context) honors the explicit param.
+                        if self.agent and hasattr(
+                            self.agent, "companion_context"
+                        ):
                             requested_by = getattr(
                                 self.agent, "companion_context", {}
-                            ).get("user_id")
+                            ).get("user_id") or None
                         return await self._generate_via_reference_image(
                             provider=reference_provider,
                             prompt=reference_prompt,
