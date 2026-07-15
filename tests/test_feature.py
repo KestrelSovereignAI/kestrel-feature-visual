@@ -618,11 +618,16 @@ class TestNoLoraReferenceRoute:
         assert provider.received_config.requested_by == "ctx-user-7"
 
     @pytest.mark.asyncio
-    async def test_explicit_requested_by_overrides_agent_context(
+    async def test_agent_context_wins_over_tool_supplied_requested_by(
         self, feature_standalone
     ):
-        """An explicit ``requested_by`` takes precedence over the agent
-        context's user_id (REST caller wins over any ambient chat context)."""
+        """Codex round-2 P1 on #12: ``generate_selfie`` is an @tool so every
+        kwarg is LLM-controllable via prompt injection. When an agent context
+        is bound, tool-supplied ``requested_by`` MUST be ignored — otherwise a
+        prompt-injected chat message could attribute the queued job to another
+        user (cross-tenant leak: their dashboard's requested_by-scoped poll
+        would then find it). Only the standalone REST path (no agent context)
+        honors the explicit kwarg."""
         feature = feature_standalone
         feature.enabled = True
         feature.db_pool = None
@@ -646,11 +651,12 @@ class TestNoLoraReferenceRoute:
             scene="beach",
             companion_id="comp-123",
             allow_training=False,
-            requested_by="rest-user-1",
+            requested_by="attacker-supplied-other-user",
         )
 
         assert result.status is ToolResultStatus.OK
-        assert provider.received_config.requested_by == "rest-user-1"
+        # Agent context wins; the attacker-supplied value is ignored.
+        assert provider.received_config.requested_by == "ctx-user-7"
 
     @pytest.mark.asyncio
     async def test_tenant_boundary_refuses_mismatched_companion_id(

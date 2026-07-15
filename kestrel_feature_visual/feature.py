@@ -1001,17 +1001,24 @@ Looking good! Want another one in a different style?"
                             .strip()
                         )
                         companion_did = await self._lookup_companion_did(companion_id)
-                        # Prefer an explicit REST-supplied user id; fall back to
-                        # the agent context's user_id on the chat path. This is
-                        # what lets a REST caller (no agent.companion_context)
-                        # attribute the queued job to the authenticated user so
-                        # the dashboard's requested_by-scoped poll can find it.
-                        if not requested_by and self.agent and hasattr(
+                        # Tenant-scoping precedence (codex round-2 P1 on #12):
+                        # `generate_selfie` is an @tool, so every kwarg is
+                        # LLM-controllable via prompt injection. If we let a
+                        # caller-supplied `requested_by` win when an agent
+                        # context is bound, a prompt-injected chat message
+                        # could attribute the queued job to another user's
+                        # ID and let that user's dashboard poll find it —
+                        # cross-tenant job leak. So: when self.agent has a
+                        # companion_context (chat path), we ALWAYS use its
+                        # user_id and IGNORE any tool-supplied
+                        # requested_by. Only the standalone REST path (no
+                        # agent context) honors the explicit param.
+                        if self.agent and hasattr(
                             self.agent, "companion_context"
                         ):
                             requested_by = getattr(
                                 self.agent, "companion_context", {}
-                            ).get("user_id")
+                            ).get("user_id") or None
                         return await self._generate_via_reference_image(
                             provider=reference_provider,
                             prompt=reference_prompt,
