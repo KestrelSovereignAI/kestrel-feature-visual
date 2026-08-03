@@ -981,3 +981,94 @@ class TestTrainLora:
         assert isinstance(result, ToolResult)
         assert result.status is ToolResultStatus.ERROR
         assert "companion_id" in result.error.lower()
+
+
+class TestSceneAndIdentityPassthrough:
+    """Regressions for cross-repo scene routing and non-str bound ids (#18)."""
+
+    @staticmethod
+    def _promoted_row(**overrides):
+        row = {
+            "image_url": "https://stored.example/avatar.png",
+            "did": "did:key:companion-123",
+            "avatar_config": {
+                "url": "https://older.example/avatar.png",
+                "lora_model_path": (
+                    "catalog://companions/comp-123/lora/sha256:promoted"
+                ),
+                "lora_ipfs_cid": "bafy-promoted-lora",
+                "trigger_word": "TOKPROMOTED",
+                "flux_version": "flux1",
+            },
+        }
+        row["avatar_config"].update(overrides)
+        return row
+
+    @pytest.mark.parametrize("scene", ["shower", "bedroom", "spread_eagle"])
+    @pytest.mark.asyncio
+    async def test_scene_outside_this_map_is_passed_through_not_coerced(
+        self, feature_standalone, scene
+    ):
+        """A scene this package does not know must survive to the consumer.
+
+        SELFIE_SCENE_PROMPTS is a deliberate subset of the vocabulary frinz
+        uses: these three are tier-gated paid sovereign scenes that route to a
+        different render engine, key the (companion_did, scene) enqueue
+        coalescing, and name the stored asset. Reporting the coerced "casual"
+        would misroute the request, collapse two distinct paid jobs into one,
+        and file the result under the wrong scene.
+        """
+        from kestrel_feature_visual.selfie_spec import SELFIE_SCENE_PROMPTS
+
+        assert scene not in SELFIE_SCENE_PROMPTS
+
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._promoted_row())
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene=scene, companion_id="comp-123", allow_training=False
+        )
+
+        assert result.status is ToolResultStatus.OK
+        assert provider.received_config.scene == scene
+        assert result.data["scene"] == scene
+
+    @pytest.mark.asyncio
+    async def test_non_str_bound_companion_id_survives_legacy_trigger_fallback(
+        self, feature_standalone
+    ):
+        """A bound UUID id must not crash the no-trigger_word legacy row path.
+
+        The host-owned companion identity replaces the caller's string, so the
+        legacy fallback that derives a trigger from the id receives a UUID.
+        Slicing it directly raised TypeError into the blanket handler and lost
+        the selfie entirely.
+        """
+        bound_companion_id = UUID("00000000-0000-0000-0000-000000000123")
+        legacy_row = self._promoted_row()
+        del legacy_row["avatar_config"]["trigger_word"]
+
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(legacy_row)
+        class _Agent:
+            def __init__(self):
+                self.companion_context = {"companion_id": bound_companion_id}
+
+        feature.agent = _Agent()
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="casual",
+            companion_id=str(bound_companion_id),
+            allow_training=False,
+        )
+
+        assert result.status is ToolResultStatus.OK, result.error
+        assert provider.received_config.trigger_word == "TOK00000000"

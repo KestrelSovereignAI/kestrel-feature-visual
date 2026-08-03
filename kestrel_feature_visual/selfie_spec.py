@@ -40,9 +40,36 @@ SELFIE_SCENE_PROMPTS: Mapping[str, str] = MappingProxyType(
 )
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+@-]{0,254}$")
-_TRIGGER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _STYLES = frozenset({"photorealistic", "anime", "artistic"})
+
+TRIGGER_WORD_MAX_LENGTH = 128
+
+
+def is_valid_trigger_word(value: object) -> bool:
+    """Return whether ``value`` may be used as a LoRA trigger.
+
+    Deliberately permissive about the character set. Triggers are minted from
+    the companion name (``TOK{name[:8]}``) and persisted alongside a LoRA that
+    was *trained* on that exact token, so a name containing a space, an
+    apostrophe, or a non-ASCII letter yields a trigger that already exists in
+    the database and cannot be rewritten without invalidating the trained
+    weights. Rejecting those would permanently break every selfie for the
+    affected companions.
+
+    What is enforced is what the prompt contract actually depends on: a
+    non-empty, bounded, single-line token with no surrounding whitespace and no
+    control characters, beginning with an alphanumeric. Regex safety does not
+    depend on this — ``_trigger_pattern`` escapes the value.
+    """
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= TRIGGER_WORD_MAX_LENGTH
+        and value[0].isalnum()
+        and value == value.strip()
+        and _CONTROL_RE.search(value) is None
+    )
 
 
 def _trigger_pattern(trigger_word: str) -> re.Pattern[str]:
@@ -90,9 +117,7 @@ class ResolvedSelfiePrompt:
         # twice — and still produce a valid downstream ``spec_sha256``.  The
         # plaintext trigger is already contained in ``prompt``, so carrying it
         # discloses nothing the object did not already hold.
-        if not isinstance(self.trigger_word, str) or not _TRIGGER_RE.fullmatch(
-            self.trigger_word
-        ):
+        if not is_valid_trigger_word(self.trigger_word):
             raise ValueError("resolved selfie prompt trigger word is invalid")
         _validate_sha256(self.trigger_word_sha256, "trigger word")
         if self.trigger_word_sha256 != _sha256_text(self.trigger_word):
@@ -220,7 +245,7 @@ def resolve_selfie_prompt(
         normalized_scene = "casual"
     if normalized_style not in _STYLES:
         raise ValueError("selfie style is unsupported")
-    if not _TRIGGER_RE.fullmatch(trigger_word):
+    if not is_valid_trigger_word(trigger_word):
         raise ValueError("LoRA trigger word is invalid")
     guidance = _decimal(guidance_scale)
     _validate_generation_parameters(

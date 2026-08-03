@@ -330,6 +330,7 @@ class VisualIdentityFeature(Feature):
         trigger_word: str,
         companion_id: Optional[str],
         companion_did: Optional[str] = None,
+        scene: Optional[str] = None,
         avatar_reference_url: Optional[str] = None,
         requested_by: Optional[str] = None,
         lora_ipfs_cid: Optional[str] = None,
@@ -348,6 +349,8 @@ class VisualIdentityFeature(Feature):
             trigger_word: LoRA trigger word
             companion_id: Authenticated companion ID for provider attribution
             companion_did: Server-resolved companion DID, when available
+            scene: Scene as the caller requested it, before this package's
+                prompt map coerces an unrecognized value
             avatar_reference_url: Server-owned avatar reference, when available
             requested_by: Authenticated requesting user, when available
             lora_ipfs_cid: Optional IPFS CID for LoRA (preferred over lora_path)
@@ -389,7 +392,15 @@ class VisualIdentityFeature(Feature):
                 seed=resolved_prompt.seed,
                 companion_id=companion_id,
                 companion_did=companion_did,
-                scene=resolved_prompt.scene,
+                # The CALLER's scene, not resolved_prompt.scene.
+                # SELFIE_SCENE_PROMPTS is a subset of the vocabulary downstream
+                # consumers use: frinz routes "shower"/"bedroom"/"spread_eagle"
+                # to a different render engine, coalesces queued work on
+                # (companion_did, scene), and names the stored asset by it.
+                # resolve_selfie_prompt coerces an unknown scene to "casual"
+                # for prompt TEXT only; propagating that coercion here would
+                # misroute paid requests and collapse two distinct jobs.
+                scene=scene if scene is not None else resolved_prompt.scene,
                 style=resolved_prompt.style,
                 resolved_prompt_sha256=resolved_prompt.prompt_sha256,
                 avatar_reference_url=avatar_reference_url,
@@ -997,11 +1008,14 @@ Looking good! Want another one in a different style?"
         except (ValueError, TypeError) as e:
             return ToolResult.failed(str(e), data={"companion_id": companion_id})
         base_prompt = prompt_template.prompt
-        # Report the scene that was actually rendered. resolve_selfie_prompt
-        # coerces an unrecognized scene to "casual", so echoing the caller's
-        # raw argument back in the result would attest a scene the prompt never
-        # used — and any digest quoted alongside it would disagree.
-        scene = prompt_template.scene
+        # NOTE: ``scene`` deliberately keeps the caller's value rather than
+        # ``prompt_template.scene``.  ``SELFIE_SCENE_PROMPTS`` is a subset of
+        # the vocabulary downstream consumers use — frinz routes "shower",
+        # "bedroom", and "spread_eagle" to a different render engine, coalesces
+        # queued work on (companion_did, scene), and stores assets under that
+        # key — so substituting the coerced "casual" here would misroute paid
+        # requests, collapse two distinct jobs onto one, and file the result
+        # under the wrong scene.
         if custom_prompt:
             logger.info(f"Using custom prompt: {custom_prompt[:80]}...")
         else:
@@ -1126,10 +1140,15 @@ Looking good! Want another one in a different style?"
                         trigger_word = companion_trigger_word
                         logger.info(f"Using trigger word from avatar_config: {trigger_word}")
                     else:
-                        # Legacy fallback - generate trigger word from companion_id
+                        # Legacy fallback - generate trigger word from companion_id.
+                        # ``companion_id`` may be the host-owned bound object
+                        # rather than a str (a UUID, typically), so normalize
+                        # before slicing; indexing it directly raised TypeError
+                        # into the blanket handler below and lost the selfie.
                         trigger_word = "TOK"
-                        if companion_id and len(companion_id) >= 8:
-                            trigger_word = f"TOK{companion_id[:8].replace('-', '')}"
+                        companion_key = str(companion_id) if companion_id else ""
+                        if len(companion_key) >= 8:
+                            trigger_word = f"TOK{companion_key[:8].replace('-', '')}"
                         logger.warning(f"No trigger_word in DB, using generated: {trigger_word}")
 
                     # NEW: Try unified provider approach first (TrainingProviderFactory)
@@ -1152,6 +1171,7 @@ Looking good! Want another one in a different style?"
                                 trigger_word=trigger_word,
                                 companion_id=companion_id,
                                 companion_did=companion_did,
+                                scene=scene,
                                 avatar_reference_url=server_avatar_reference_url,
                                 requested_by=requested_by,
                                 lora_ipfs_cid=lora_ipfs_cid,  # Pass IPFS CID (preferred)
@@ -1277,7 +1297,7 @@ Looking good! Want another one in a different style?"
         # Import TrainingConfig
         from kestrel_sovereign.features.training import TrainingConfig
 
-        trigger_word = f"TOK{companion_id[:8]}"
+        trigger_word = f"TOK{str(companion_id)[:8]}"
         config = TrainingConfig(trigger_word=trigger_word)
 
         try:

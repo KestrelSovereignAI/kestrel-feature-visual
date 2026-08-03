@@ -90,7 +90,10 @@ def test_custom_prompt_rejects_multiple_trigger_bindings(custom_prompt) -> None:
     ("changes", "field", "error_type"),
     [
         ({"style": "cinematic"}, "style", ValueError),
-        ({"trigger_word": "bad trigger"}, "trigger", ValueError),
+        ({"trigger_word": " TOKluna"}, "trigger", ValueError),
+        ({"trigger_word": "TOKluna\n"}, "trigger", ValueError),
+        ({"trigger_word": "-TOKluna"}, "trigger", ValueError),
+        ({"trigger_word": ""}, "trigger", ValueError),
         ({"lora_encrypted_sha256": "bad"}, "digest", ValueError),
         ({"lora_plaintext_sha256": "bad"}, "digest", ValueError),
         ({"seed": -1}, "seed", ValueError),
@@ -256,3 +259,46 @@ def test_content_free_spec_revalidates_every_public_construction(
 
     with pytest.raises((TypeError, ValueError), match=error):
         replace(expected, **{field: value})
+
+
+@pytest.mark.parametrize(
+    "companion_name",
+    ["Anna Marie", "Émilie", "O'Brien", "李小明", "Mary-Jane", "Luna"],
+)
+def test_triggers_this_package_mints_are_accepted(companion_name) -> None:
+    """Triggers are minted as ``TOK{companion_name[:8]}`` and persisted.
+
+    A LoRA is trained on that exact token, so the stored value cannot be
+    rewritten without invalidating the weights. Rejecting a name containing a
+    space, apostrophe, or non-ASCII letter would permanently break every
+    selfie for the affected companion.
+    """
+    trigger = f"TOK{companion_name[:8]}"
+    resolved = resolve_selfie_prompt(
+        scene="casual",
+        style="photorealistic",
+        custom_prompt=None,
+        trigger_word=trigger,
+    )
+    assert resolved.trigger_word == trigger
+    assert trigger in resolved.prompt
+
+
+def test_trigger_binding_still_exact_for_a_trigger_containing_a_space() -> None:
+    """Whole-token matching must survive the permissive character set."""
+    trigger = "TOKAnna Mar"
+    resolved = resolve_selfie_prompt(
+        scene="casual",
+        style="photorealistic",
+        custom_prompt=f"{trigger} reading a book",
+        trigger_word=trigger,
+    )
+    assert resolved.prompt.count(trigger) == 1
+
+    with pytest.raises(ValueError, match="bind the trigger once"):
+        resolve_selfie_prompt(
+            scene="casual",
+            style="photorealistic",
+            custom_prompt=f"{trigger} beside {trigger}",
+            trigger_word=trigger,
+        )
