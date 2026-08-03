@@ -22,9 +22,22 @@ The feature is auto-discovered by Kestrel Sovereign via the `kestrel_sovereign.f
 - `generate_selfie` — Generate a selfie in various scenes (casual, portrait, glamour, flirty, cozy, adventure, mysterious, romantic, playful, dreamy, confident)
 - `train_lora` — Kick off LoRA training for character consistency (requires `kestrel-feature-lora` or another training provider installed alongside)
 
+## Canonical LoRA selfie specification
+
+Queue-backed providers must use `resolve_lora_selfie_spec()` when a selfie is
+quoted and `bind_lora_selfie_spec()` immediately before dispatch. Both paths
+produce the same content-free `spec_sha256` over the final prompt hash,
+generation parameters, and immutable promoted-LoRA identity. The plaintext
+prompt remains transient and is never part of the persisted evidence object.
+
+The public `ResolvedSelfiePrompt` object carries the exact values that must be
+sent to the image worker, including seed, dimensions, inference steps, and
+guidance scale. Providers must reject a reconstructed digest that differs from
+the accepted quote.
+
 ## Dependencies
 
-- `kestrel-sovereign-sdk>=0.14.1,<1` — base `Feature`, `tool`, and `ToolCategory` interfaces
+- `kestrel-sovereign-sdk>=0.25.0,<1` — base `Feature`, `tool`, and `ToolCategory` interfaces
 - `replicate>=1.0.4` — Replicate API client
 - `httpx>=0.27.0` — HTTP transport
 

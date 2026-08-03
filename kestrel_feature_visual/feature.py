@@ -33,6 +33,12 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .selfie_spec import (
+    SELFIE_SCENE_PROMPTS,
+    ResolvedSelfiePrompt,
+    resolve_selfie_prompt,
+)
+
 
 def _reference_url_is_safe(url: str) -> bool:
     """True if a caller-supplied reference-image URL is safe to dispatch.
@@ -319,7 +325,7 @@ class VisualIdentityFeature(Feature):
 
     async def _generate_with_provider(
         self,
-        prompt: str,
+        resolved_prompt: ResolvedSelfiePrompt,
         lora_path: str,
         trigger_word: str,
         companion_id: Optional[str],
@@ -338,7 +344,7 @@ class VisualIdentityFeature(Feature):
         (only supported by RunPod adapter currently).
 
         Args:
-            prompt: Generation prompt
+            resolved_prompt: Canonical final prompt and generation parameters
             lora_path: Path to LoRA model (GCS path or local)
             trigger_word: LoRA trigger word
             companion_id: Authenticated companion ID for provider attribution
@@ -374,14 +380,23 @@ class VisualIdentityFeature(Feature):
             # from silently dropping the authenticated companion/user context
             # a catalog provider needs to bind the promoted active model.
             config = self._build_generation_config(
-                prompt=prompt,
+                prompt=resolved_prompt.prompt,
                 lora_path=lora_path,
                 trigger_word=trigger_word,
+                num_outputs=resolved_prompt.num_outputs,
+                width=resolved_prompt.width,
+                height=resolved_prompt.height,
+                num_inference_steps=resolved_prompt.num_inference_steps,
+                guidance_scale=float(resolved_prompt.guidance_scale),
+                seed=resolved_prompt.seed,
                 companion_id=companion_id,
                 companion_did=companion_did,
-                scene=scene,
+                scene=resolved_prompt.scene,
+                style=resolved_prompt.style,
+                resolved_prompt_sha256=resolved_prompt.prompt_sha256,
                 avatar_reference_url=avatar_reference_url,
                 requested_by=requested_by,
+                flux_version=flux_version,
             )
 
             # Log which LoRA source we're using
@@ -528,12 +543,20 @@ class VisualIdentityFeature(Feature):
         lora_path: Optional[str] = None,
         trigger_word: str = "TOK",
         num_outputs: int = 1,
+        width: int = 1024,
+        height: int = 1024,
+        num_inference_steps: int = 28,
+        guidance_scale: float = 4.0,
+        seed: int = 0,
         companion_id: Optional[str] = None,
         companion_did: Optional[str] = None,
         scene: Optional[str] = None,
+        style: Optional[str] = None,
+        resolved_prompt_sha256: Optional[str] = None,
         avatar_reference_url: Optional[str] = None,
         requested_by: Optional[str] = None,
         engine_hint: Optional[str] = None,
+        flux_version: Optional[str] = None,
     ) -> "GenerationConfig":
         """Build a ``GenerationConfig`` carrying companion context.
 
@@ -547,9 +570,13 @@ class VisualIdentityFeature(Feature):
             "companion_id": companion_id,
             "companion_did": companion_did,
             "scene": scene,
+            "style": style,
+            "resolved_prompt_sha256": resolved_prompt_sha256,
             "avatar_reference_url": avatar_reference_url,
             "requested_by": requested_by,
             "engine_hint": engine_hint,
+            "flux_version": flux_version,
+            "seed": seed,
         }
         try:
             config = GenerationConfig(
@@ -557,6 +584,10 @@ class VisualIdentityFeature(Feature):
                 lora_path=lora_path,
                 trigger_word=trigger_word,
                 num_outputs=num_outputs,
+                width=width,
+                height=height,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
                 **{k: v for k, v in context.items() if v is not None},
             )
         except TypeError:
@@ -565,6 +596,10 @@ class VisualIdentityFeature(Feature):
                 lora_path=lora_path,
                 trigger_word=trigger_word,
                 num_outputs=num_outputs,
+                width=width,
+                height=height,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
             )
         # Older SDKs lack the companion-context fields entirely; make sure they
         # are present (defaulting to None) so downstream code can always read
@@ -797,36 +832,7 @@ Looking good! Want another one in a different style?"
 
     # Scene-specific prompt enhancements (shared across methods)
     # Each scene should include: setting, clothing/attire, pose, lighting
-    SCENE_PROMPTS = {
-        "portrait": "professional headshot, studio lighting, neutral background, business attire",
-        "casual": "casual selfie at home, comfortable clothes, natural lighting, relaxed smile",
-        "glamour": "glamorous evening setting, elegant black dress, sophisticated pose, studio lighting",
-        "flirty": "playful smile, flirtatious expression, slight head tilt, soft lighting",
-        "cozy": "cozy home setting, comfortable sweater, warm atmosphere, soft natural light",
-        "adventure": "outdoor hiking setting, athletic wear, dynamic pose, bright daylight",
-        "mysterious": "dramatic shadows, dark elegant attire, enigmatic expression, moody lighting",
-        "romantic": "soft romantic candlelit setting, elegant dress, intimate atmosphere, warm colors",
-        "playful": "fun playful expression, colorful casual outfit, bright colors, dynamic pose",
-        "dreamy": "dreamy soft focus, flowing white dress, ethereal lighting, pastel colors",
-        "confident": "confident powerful pose, professional attire, strong lighting, bold composition",
-        # Beach and swimwear scenes
-        "beach": "at the beach, bikini swimsuit, golden hour sunset lighting, ocean waves in background, beautiful smile, selfie angle",
-        "swimsuit": "poolside setting, stylish bikini, bright sunny day, relaxed pose, tropical vibes",
-        "tropical": "tropical beach paradise, colorful bikini, palm trees, crystal clear water, vacation selfie",
-        "pool": "luxury pool setting, designer swimwear, sunglasses, lounge chair, summer vibes",
-        # Additional lifestyle scenes
-        "fitness": "gym or yoga studio, athletic sports bra and leggings, energetic pose, natural lighting",
-        "nightout": "nightclub or bar setting, sexy cocktail dress, glamorous makeup, neon lights",
-        "lingerie": "elegant bedroom setting, tasteful lingerie, soft boudoir lighting, confident pose",
-        "summer": "sunny outdoor cafe, sundress, bright daylight, happy relaxed expression",
-        # Professional/occupational scenes
-        "nurse": "healthcare setting, nurse scrubs with stethoscope, hospital or clinic background, professional caring expression, soft clinical lighting",
-        # Adult scenes (for sovereign companions - requires uncensored model variant)
-        # Note: Base FLUX models have content filtering. For explicit content,
-        # use fine-tuned uncensored variants (e.g., FLUX.1-dev uncensored)
-        "topless": "artistic portrait, bare breasts visible, tasteful nude photography, studio lighting, sensual pose",
-        "nude": "full nude portrait, artistic nude photography, studio setting, tasteful pose, natural lighting",
-    }
+    SCENE_PROMPTS = SELFIE_SCENE_PROMPTS
 
     @tool(
         name="generate_selfie",
@@ -949,7 +955,6 @@ Looking good! Want another one in a different style?"
         )
 
         scene = scene.lower()
-        scene_description = self.SCENE_PROMPTS.get(scene, self.SCENE_PROMPTS["casual"])
 
         # Look up companion appearance and trigger word if we have a companion_id and db_pool
         companion_appearance = ""
@@ -975,26 +980,19 @@ Looking good! Want another one in a different style?"
             except Exception as e:
                 logger.warning(f"Failed to lookup companion appearance: {e}")
 
-        # Build enhanced prompt - trigger word will be prepended later when we have it
-        # NOTE: The LoRA trigger word ALREADY encodes appearance (face, hair, body, clothing from training).
-        # We should NOT append companion_appearance as it's redundant and can conflict with scene requests.
-        # If custom_prompt provided, use it directly (for censorship testing, etc.)
+        # Resolve the placeholder form through the same pure function the
+        # accepted-quote product path uses with the promoted LoRA trigger.
+        prompt_template = resolve_selfie_prompt(
+            scene=scene,
+            style=style,
+            custom_prompt=custom_prompt,
+            trigger_word="TRIGGER_WORD",
+        )
+        base_prompt = prompt_template.prompt
         if custom_prompt:
-            # Replace TRIGGER_WORD placeholder if present, otherwise prepend it
-            if "TRIGGER_WORD" in custom_prompt:
-                base_prompt = custom_prompt
-            else:
-                base_prompt = f"TRIGGER_WORD, {custom_prompt}"
             logger.info(f"Using custom prompt: {custom_prompt[:80]}...")
         else:
-            # Use ONLY scene description - trigger word already has appearance baked in from LoRA training
-            base_prompt = f"A photo of TRIGGER_WORD, {scene_description}. High quality, photorealistic, 8k."
             logger.info(f"Using scene '{scene}' with trigger word only (no appearance override)")
-
-            if style == "anime":
-                base_prompt = f"anime style illustration, {base_prompt}"
-            elif style == "artistic":
-                base_prompt = f"artistic portrait painting style, {base_prompt}"
 
         trained_this_request = False
         used_lora = False
@@ -1126,12 +1124,17 @@ Looking good! Want another one in a different style?"
                     training_provider = self._get_training_provider(provider)
                     if training_provider and hasattr(training_provider, 'generate_image'):
                         try:
-                            # Replace TRIGGER_WORD placeholder with actual trigger word
-                            final_prompt = base_prompt.replace("TRIGGER_WORD", trigger_word)
+                            resolved_prompt = resolve_selfie_prompt(
+                                scene=scene,
+                                style=style,
+                                custom_prompt=custom_prompt,
+                                trigger_word=trigger_word,
+                            )
+                            final_prompt = resolved_prompt.prompt
                             logger.info(f"Final prompt: {final_prompt[:100]}...")
 
                             result = await self._generate_with_provider(
-                                prompt=final_prompt,
+                                resolved_prompt=resolved_prompt,
                                 lora_path=lora_model_path,
                                 trigger_word=trigger_word,
                                 companion_id=companion_id,

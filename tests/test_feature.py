@@ -197,6 +197,8 @@ class TestBuildGenerationConfig:
             companion_id="comp-123",
             companion_did="did:key:abc",
             scene="beach",
+            style="anime",
+            resolved_prompt_sha256="a" * 64,
             avatar_reference_url="https://avatar.example/a.png",
             requested_by="user-9",
             engine_hint="pulid-avatar",
@@ -206,6 +208,8 @@ class TestBuildGenerationConfig:
         assert config.companion_id == "comp-123"
         assert config.companion_did == "did:key:abc"
         assert config.scene == "beach"
+        assert config.style == "anime"
+        assert config.resolved_prompt_sha256 == "a" * 64
         assert config.avatar_reference_url == "https://avatar.example/a.png"
         assert config.requested_by == "user-9"
         assert config.engine_hint == "pulid-avatar"
@@ -220,6 +224,8 @@ class TestBuildGenerationConfig:
         assert config.companion_id is None
         assert config.companion_did is None
         assert config.scene is None
+        assert config.style is None
+        assert config.resolved_prompt_sha256 is None
         assert config.avatar_reference_url is None
         assert config.requested_by is None
         assert config.engine_hint is None
