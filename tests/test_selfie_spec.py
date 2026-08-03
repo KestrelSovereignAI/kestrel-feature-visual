@@ -54,6 +54,35 @@ def test_custom_prompt_is_normalized_and_triggered_once() -> None:
     assert prompt.prompt.count("TOKluna") == 1
 
 
+def test_custom_prompt_with_explicit_trigger_is_not_prefixed_again() -> None:
+    prompt = resolve_selfie_prompt(
+        scene="beach",
+        style="photorealistic",
+        custom_prompt="portrait of TOKluna beside the sea",
+        trigger_word="TOKluna",
+    )
+
+    assert prompt.prompt == "portrait of TOKluna beside the sea"
+    assert prompt.prompt.count("TOKluna") == 1
+
+
+@pytest.mark.parametrize(
+    "custom_prompt",
+    (
+        "TRIGGER_WORD beside TRIGGER_WORD",
+        "TOKluna beside TOKluna",
+    ),
+)
+def test_custom_prompt_rejects_multiple_trigger_bindings(custom_prompt) -> None:
+    with pytest.raises(ValueError, match="bind the trigger once"):
+        resolve_selfie_prompt(
+            scene="beach",
+            style="photorealistic",
+            custom_prompt=custom_prompt,
+            trigger_word="TOKluna",
+        )
+
+
 @pytest.mark.parametrize(
     ("changes", "field", "error_type"),
     [

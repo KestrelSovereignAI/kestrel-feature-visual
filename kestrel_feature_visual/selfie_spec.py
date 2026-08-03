@@ -164,10 +164,23 @@ def resolve_selfie_prompt(
 
     normalized_custom = _normalize_prompt(custom_prompt)
     if normalized_custom:
-        if "TRIGGER_WORD" in normalized_custom:
+        placeholder_count = normalized_custom.count("TRIGGER_WORD")
+        if placeholder_count > 1:
+            raise ValueError("selfie custom prompt must bind the trigger once")
+        if placeholder_count == 1:
             prompt = normalized_custom.replace("TRIGGER_WORD", trigger_word)
         else:
-            prompt = f"{trigger_word}, {normalized_custom}"
+            trigger_pattern = re.compile(
+                rf"(?<![A-Za-z0-9_-]){re.escape(trigger_word)}(?![A-Za-z0-9_-])"
+            )
+            trigger_count = len(trigger_pattern.findall(normalized_custom))
+            if trigger_count > 1:
+                raise ValueError("selfie custom prompt must bind the trigger once")
+            prompt = (
+                normalized_custom
+                if trigger_count == 1
+                else f"{trigger_word}, {normalized_custom}"
+            )
     else:
         prompt = (
             f"A photo of {trigger_word}, {SELFIE_SCENE_PROMPTS[normalized_scene]}. "
