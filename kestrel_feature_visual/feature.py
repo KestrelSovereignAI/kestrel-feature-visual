@@ -327,7 +327,6 @@ class VisualIdentityFeature(Feature):
         self,
         resolved_prompt: ResolvedSelfiePrompt,
         lora_path: str,
-        trigger_word: str,
         companion_id: Optional[str],
         companion_did: Optional[str] = None,
         scene: Optional[str] = None,
@@ -346,7 +345,6 @@ class VisualIdentityFeature(Feature):
         Args:
             resolved_prompt: Canonical final prompt and generation parameters
             lora_path: Path to LoRA model (GCS path or local)
-            trigger_word: LoRA trigger word
             companion_id: Authenticated companion ID for provider attribution
             companion_did: Server-resolved companion DID, when available
             scene: Scene as the caller requested it, before this package's
@@ -383,7 +381,13 @@ class VisualIdentityFeature(Feature):
             config = self._build_generation_config(
                 prompt=resolved_prompt.prompt,
                 lora_path=lora_path,
-                trigger_word=trigger_word,
+                # Must be the SAME token the resolved prompt binds.  A stored
+                # trigger can be uncanonical ('TOKMaria J ' with a trailing
+                # space), and resolve_selfie_prompt canonicalizes it.  Sending
+                # the raw form alongside a normalized prompt makes the worker's
+                # `if trigger_word not in prompt` guard re-prepend the trigger,
+                # binding it twice — the exact invariant this type enforces.
+                trigger_word=resolved_prompt.trigger_word,
                 num_outputs=resolved_prompt.num_outputs,
                 width=resolved_prompt.width,
                 height=resolved_prompt.height,
@@ -1156,19 +1160,27 @@ Looking good! Want another one in a different style?"
                     training_provider = self._get_training_provider(provider)
                     if training_provider and hasattr(training_provider, 'generate_image'):
                         try:
-                            resolved_prompt = resolve_selfie_prompt(
-                                scene=scene,
-                                style=style,
-                                custom_prompt=custom_prompt,
-                                trigger_word=trigger_word,
-                            )
+                            # Same conversion as the placeholder resolve above:
+                            # substituting the real trigger can newly double-bind
+                            # a custom prompt that passed the placeholder form,
+                            # and that is caller input, not an internal fault.
+                            try:
+                                resolved_prompt = resolve_selfie_prompt(
+                                    scene=scene,
+                                    style=style,
+                                    custom_prompt=custom_prompt,
+                                    trigger_word=trigger_word,
+                                )
+                            except (ValueError, TypeError) as e:
+                                return ToolResult.failed(
+                                    str(e), data={"companion_id": companion_id}
+                                )
                             final_prompt = resolved_prompt.prompt
                             logger.info(f"Final prompt: {final_prompt[:100]}...")
 
                             result = await self._generate_with_provider(
                                 resolved_prompt=resolved_prompt,
                                 lora_path=lora_model_path,
-                                trigger_word=trigger_word,
                                 companion_id=companion_id,
                                 companion_did=companion_did,
                                 scene=scene,

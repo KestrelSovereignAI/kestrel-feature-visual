@@ -1070,3 +1070,90 @@ class TestSceneAndIdentityPassthrough:
 
         assert result.status is ToolResultStatus.OK, result.error
         assert provider.received_config.trigger_word == "TOK00000000"
+
+
+class TestDispatchedTriggerBinding:
+    """The exactly-once invariant must hold at the config a provider gets."""
+
+    @staticmethod
+    def _row(trigger_word):
+        return {
+            "image_url": "https://stored.example/avatar.png",
+            "did": "did:key:companion-123",
+            "avatar_config": {
+                "lora_model_path": "catalog://c/lora/sha256:promoted",
+                "lora_ipfs_cid": "bafy-promoted-lora",
+                "trigger_word": trigger_word,
+                "flux_version": "flux1",
+            },
+        }
+
+    @pytest.mark.parametrize(
+        "stored_trigger",
+        [
+            "TOKPROMOTED",     # already canonical
+            "TOKMaria J ",     # trailing space  (name "Maria J Lopez")
+            "TOKLi  Wei",      # doubled space   (name "Li  Wei")
+            "TOKMary\tJan",    # embedded tab    (name "Mary\tJane")
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_config_trigger_is_the_one_the_prompt_binds(
+        self, feature_standalone, stored_trigger
+    ):
+        """``config.trigger_word`` must be the token ``config.prompt`` contains.
+
+        The worker prepends the trigger when ``trigger_word not in prompt``
+        (simpletuner_api inference route). Sending the raw stored value beside
+        a canonicalized prompt makes that guard fire and bind the trigger a
+        second time — silently, on paid renders, for exactly the companions
+        canonicalization was added to support.
+        """
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._row(stored_trigger))
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="casual", companion_id="comp-123", allow_training=False
+        )
+
+        assert result.status is ToolResultStatus.OK, result.error
+        config = provider.received_config
+        # The worker's guard must not fire...
+        assert config.trigger_word in config.prompt
+        # ...and the token must appear exactly once.
+        assert config.prompt.count(config.trigger_word) == 1
+
+
+    @pytest.mark.asyncio
+    async def test_custom_prompt_double_binding_the_real_trigger_fails_in_contract(
+        self, feature_standalone
+    ):
+        """A prompt valid in placeholder form can double-bind the real trigger.
+
+        ``TRIGGER_WORD and TOKPROMOTED`` passes the placeholder resolve and only
+        collides once the promoted trigger is substituted. That is caller input,
+        so it must return the tool's failure envelope rather than reach the
+        blanket handler with no structured data.
+        """
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._row("TOKPROMOTED"))
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="casual",
+            companion_id="comp-123",
+            custom_prompt="TRIGGER_WORD and TOKPROMOTED",
+            allow_training=False,
+        )
+
+        assert result.status is ToolResultStatus.ERROR
+        assert "bind the trigger once" in result.error
+        assert result.data == {"companion_id": "comp-123"}
+        assert provider.generate_calls == 0
