@@ -41,7 +41,32 @@ SELFIE_SCENE_PROMPTS: Mapping[str, str] = MappingProxyType(
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+@-]{0,254}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
-_SCENE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+DESCRIPTOR_MAX_LENGTH = 128
+
+
+def normalize_descriptor(value: str) -> str:
+    """Canonicalize a caller-supplied scene or style label.
+
+    Scene and style are owned by the CALLER, not by this package. frinz
+    forwards both unvalidated from an HTTP body and from LLM tool arguments,
+    and deliberately supports free-form prose scenes - its own comment records
+    that fail-closed handling wrongly 403'd "stargazing at night with aurora
+    borealis". So these are normalized for exact-match lookups downstream, and
+    never rejected for failing to appear in this package's tables.
+    """
+    return " ".join(value.split()).lower()
+
+
+def is_valid_descriptor(value: object) -> bool:
+    """Bound a descriptor without constraining its vocabulary."""
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= DESCRIPTOR_MAX_LENGTH
+        and value == normalize_descriptor(value)
+        and _CONTROL_RE.search(value) is None
+    )
+
+
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _STYLES = frozenset({"photorealistic", "anime", "artistic"})
 
@@ -112,9 +137,9 @@ class ResolvedSelfiePrompt:
     guidance_scale: Decimal
 
     def __post_init__(self) -> None:
-        if not isinstance(self.scene, str) or not _SCENE_RE.fullmatch(self.scene):
+        if not is_valid_descriptor(self.scene):
             raise ValueError("resolved selfie prompt scene is invalid")
-        if self.style not in _STYLES:
+        if not is_valid_descriptor(self.style):
             raise ValueError("resolved selfie prompt style is invalid")
         if (
             not isinstance(self.prompt, str)
@@ -178,9 +203,9 @@ class ResolvedLoraSelfieSpec:
     def __post_init__(self) -> None:
         if self.schema_version != SELFIE_SPEC_SCHEMA_VERSION:
             raise ValueError("selfie spec schema version is unsupported")
-        if not isinstance(self.scene, str) or not _SCENE_RE.fullmatch(self.scene):
+        if not is_valid_descriptor(self.scene):
             raise ValueError("selfie spec scene is invalid")
-        if self.style not in _STYLES:
+        if not is_valid_descriptor(self.style):
             raise ValueError("selfie spec style is invalid")
         for value, label in (
             (self.lora_version_id, "LoRA version id"),
@@ -275,12 +300,12 @@ def resolve_selfie_prompt(
     # describe three different things and collapsed four distinct paid quotes
     # onto one digest. Only the descriptive prompt TEXT depends on the map:
     # an unknown scene contributes none rather than claiming to be "casual".
-    normalized_scene = scene.strip().lower()
-    if not _SCENE_RE.fullmatch(normalized_scene):
+    normalized_scene = normalize_descriptor(scene)
+    if not is_valid_descriptor(normalized_scene):
         raise ValueError("selfie scene is invalid")
-    normalized_style = style.strip().lower()
-    if normalized_style not in _STYLES:
-        raise ValueError("selfie style is unsupported")
+    normalized_style = normalize_descriptor(style)
+    if not is_valid_descriptor(normalized_style):
+        raise ValueError("selfie style is invalid")
     if not is_valid_trigger_word(trigger_word):
         raise ValueError("LoRA trigger word is invalid")
     guidance = _decimal(guidance_scale)
@@ -311,13 +336,21 @@ def resolve_selfie_prompt(
                 else f"{trigger_word}, {normalized_custom}"
             )
     else:
+        # An unknown scene contributes no invented description, but the
+        # "A photo of <trigger>, " prefix shape is kept identical either way:
+        # the no-LoRA reference route strips exactly that prefix, and changing
+        # it left a subjectless "A photo of . High quality..." behind.
         scene_text = SELFIE_SCENE_PROMPTS.get(normalized_scene)
         prompt = (
             f"A photo of {trigger_word}, {scene_text}. "
             "High quality, photorealistic, 8k."
             if scene_text
-            else f"A photo of {trigger_word}. High quality, photorealistic, 8k."
+            else f"A photo of {trigger_word}, High quality, photorealistic, 8k."
         )
+        # Known styles add a prefix; an unrecognized one simply adds none, as
+        # origin/main did. frinz forwards style unvalidated from an HTTP body
+        # and from LLM tool arguments, so "cinematic" or "realistic" must keep
+        # producing a selfie rather than failing the request.
         if normalized_style == "anime":
             prompt = f"anime style illustration, {prompt}"
         elif normalized_style == "artistic":

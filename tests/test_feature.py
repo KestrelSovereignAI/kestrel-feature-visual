@@ -183,12 +183,11 @@ class TestGenerateSelfie:
     @pytest.mark.parametrize(
         "kwargs, expected",
         [
-            ({"style": "cinematic"}, "style is unsupported"),
-            ({"style": "realistic"}, "style is unsupported"),
             (
                 {"custom_prompt": "TRIGGER_WORD next to TRIGGER_WORD"},
                 "bind the trigger once",
             ),
+            ({"scene": "x" * 200}, "scene is invalid"),
         ],
     )
     @pytest.mark.asyncio
@@ -205,7 +204,8 @@ class TestGenerateSelfie:
         # Past the availability guard so the prompt actually gets resolved.
         feature_standalone.enabled = True
 
-        result = await feature_standalone.generate_selfie(scene="casual", **kwargs)
+        kwargs.setdefault("scene", "casual")
+        result = await feature_standalone.generate_selfie(**kwargs)
 
         assert isinstance(result, ToolResult)
         assert result.status is ToolResultStatus.ERROR
@@ -1157,3 +1157,132 @@ class TestDispatchedTriggerBinding:
         assert "bind the trigger once" in result.error
         assert result.data == {"companion_id": "comp-123"}
         assert provider.generate_calls == 0
+
+
+class TestCallerOwnedDescriptors:
+    """scene/style come from frinz unvalidated; this package must not gate them."""
+
+    @staticmethod
+    def _row():
+        return {
+            "image_url": "https://stored.example/avatar.png",
+            "did": "did:key:companion-123",
+            "avatar_config": {
+                "lora_model_path": "catalog://c/lora/sha256:promoted",
+                "trigger_word": "TOKPROMOTED",
+            },
+        }
+
+    @pytest.mark.parametrize(
+        "scene, style",
+        [
+            ("rooftop bar at sunset", "photorealistic"),  # frinz prose scene
+            ("stargazing at night with aurora borealis", "cinematic"),
+            ("Café", "realistic"),
+            ("shower", "anime"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_free_form_scene_and_style_still_produce_a_selfie(
+        self, feature_standalone, scene, style
+    ):
+        """frinz forwards both unvalidated and supports prose scenes by design.
+
+        scene_keywords.selfie_scene_upgrade_detail records that fail-closed
+        handling wrongly 403'd "stargazing at night with aurora borealis", and
+        both endpoints declare scene/style as unconstrained str. Rejecting
+        them here turns a working paid request into an error.
+        """
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._row())
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene=scene, style=style, companion_id="comp-123", allow_training=False
+        )
+
+        assert result.status is ToolResultStatus.OK, result.error
+        assert provider.received_config.scene == " ".join(scene.split()).lower()
+        assert provider.received_config.style == style.lower()
+
+    @pytest.mark.asyncio
+    async def test_scene_is_normalized_before_it_leaves_the_feature(
+        self, feature_standalone
+    ):
+        """frinz keys routing, job coalescing and asset names on exact match."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._row())
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="  BeAcH  ", companion_id="comp-123", allow_training=False
+        )
+
+        assert result.status is ToolResultStatus.OK, result.error
+        assert provider.received_config.scene == "beach"
+        assert result.data["scene"] == "beach"
+
+
+class TestReferenceRoutePromptShape:
+    """The no-LoRA route must never emit a subjectless prompt (#18 review 6)."""
+
+    @staticmethod
+    async def _run(feature, scene, custom_prompt=None):
+        feature.enabled = True
+        feature.db_pool = None
+        provider = _FakeProvider("catalog_worker", supports_reference_image=True)
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        async def _fake_lookup(_cid):
+            return "https://avatar.example/a.png"
+
+        feature._lookup_avatar_url = _fake_lookup
+        result = await feature.generate_selfie(
+            scene=scene,
+            companion_id="comp-123",
+            custom_prompt=custom_prompt,
+            allow_training=False,
+        )
+        return result, provider.received_config
+
+    @pytest.mark.parametrize("scene", ["shower", "bedroom", "spread_eagle"])
+    @pytest.mark.asyncio
+    async def test_unknown_scene_sends_no_override_so_the_worker_template_wins(
+        self, feature_standalone, scene
+    ):
+        """This package has no description for a sovereign scene.
+
+        Emitting "A photo of . High quality..." would drive a paid render with
+        no subject and no scene, and the catalog worker honours
+        prompt_override unconditionally, so its own scene template would never
+        be consulted. Sending nothing lets that template win.
+        """
+        from kestrel_feature_visual.selfie_spec import SELFIE_SCENE_PROMPTS
+
+        assert scene not in SELFIE_SCENE_PROMPTS
+        result, config = await self._run(feature_standalone, scene)
+
+        assert result.status is ToolResultStatus.OK, result.error
+        assert config.scene == scene
+        assert not config.prompt
+        assert "A photo of ." not in (config.prompt or "")
+
+    @pytest.mark.asyncio
+    async def test_known_scene_still_sends_a_coherent_trigger_free_prompt(
+        self, feature_standalone
+    ):
+        from kestrel_feature_visual.selfie_spec import SELFIE_SCENE_PROMPTS
+
+        result, config = await self._run(feature_standalone, "beach")
+
+        assert result.status is ToolResultStatus.OK, result.error
+        assert SELFIE_SCENE_PROMPTS["beach"] in config.prompt
+        assert "TRIGGER_WORD" not in config.prompt
+        assert "A photo of ." not in config.prompt

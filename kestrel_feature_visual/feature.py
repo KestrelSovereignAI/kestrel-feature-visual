@@ -1086,12 +1086,27 @@ Looking good! Want another one in a different style?"
                         # no identity anchor the PuLID worker has nothing to
                         # reference, so we fall through to training/fail instead
                         # of enqueuing an unrouteable job.
-                        reference_prompt = (
-                            base_prompt.replace("A photo of TRIGGER_WORD, ", "A photo of ")
-                            .replace("TRIGGER_WORD, ", "")
-                            .replace("TRIGGER_WORD", "")
-                            .strip()
-                        )
+                        # Derive the trigger-free prompt from the resolver's
+                        # own output rather than guessing its shape. When there
+                        # is no custom prompt AND this package has no
+                        # description for the scene, we have nothing useful to
+                        # say: send an empty override so the catalog worker's
+                        # own scene template wins instead of a subjectless
+                        # "A photo of ..." stub.
+                        if custom_prompt:
+                            reference_prompt = (
+                                base_prompt.replace("TRIGGER_WORD, ", "")
+                                .replace("TRIGGER_WORD", "")
+                                .strip()
+                            )
+                        elif SELFIE_SCENE_PROMPTS.get(prompt_template.scene):
+                            reference_prompt = (
+                                f"A photo of "
+                                f"{SELFIE_SCENE_PROMPTS[prompt_template.scene]}. "
+                                "High quality, photorealistic, 8k."
+                            )
+                        else:
+                            reference_prompt = ""
                         return await self._generate_via_reference_image(
                             provider=reference_provider,
                             prompt=reference_prompt,

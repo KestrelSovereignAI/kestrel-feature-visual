@@ -91,7 +91,7 @@ def test_custom_prompt_rejects_multiple_trigger_bindings(custom_prompt) -> None:
 @pytest.mark.parametrize(
     ("changes", "field", "error_type"),
     [
-        ({"style": "cinematic"}, "style", ValueError),
+        ({"style": "x" * 200}, "style", ValueError),
         ({"trigger_word": "-TOKluna"}, "trigger", ValueError),
         ({"trigger_word": "   "}, "trigger", ValueError),
         ({"trigger_word": ""}, "trigger", ValueError),
@@ -248,7 +248,7 @@ def test_content_free_spec_rejects_a_forged_digest() -> None:
     (
         ("schema_version", 2, "schema version"),
         ("scene", "Unknown Scene", "scene"),
-        ("scene", "-leading-dash", "scene"),
+        ("scene", "x" * 200, "scene"),
         ("lora_version_id", "bad value", "LoRA version id"),
         ("lora_encrypted_sha256", "bad", "encrypted LoRA digest"),
         ("width", 1025, "width"),

@@ -30,12 +30,21 @@ produce the same content-free `spec_sha256` over the final prompt hash,
 generation parameters, and immutable promoted-LoRA identity. The plaintext
 prompt remains transient and is never part of the persisted evidence object.
 
-The `scene` a caller asks for is preserved, never swapped for another.
-`SELFIE_SCENE_PROMPTS` is a deliberate subset of the vocabulary downstream consumers
-use, so it governs only the descriptive prompt *text*: a scene outside it contributes
-no description rather than silently rendering as `casual`. The scene therefore reads
-the same on the resolved prompt, the generation config, the returned result, and
-`spec_sha256`, and two different scenes can never share a digest.
+`scene` and `style` are **caller-owned**. This package normalizes them (whitespace
+collapsed, lowercased) and bounds their length, but never rejects one for failing to
+appear in its own tables — frinz forwards both unvalidated from an HTTP body and from
+LLM tool arguments, and deliberately supports free-form prose scenes such as
+`stargazing at night with aurora borealis`.
+
+`SELFIE_SCENE_PROMPTS` and the style prefixes therefore govern only the descriptive
+prompt *text*: an unrecognized scene contributes no description rather than silently
+rendering as `casual`, and an unrecognized style adds no prefix. The scene reads the
+same on the resolved prompt, the generation config, the returned result, and
+`spec_sha256`, so two different scenes can never share a digest.
+
+On the no-LoRA reference route, when there is neither a custom prompt nor a known
+scene description this package sends **no** prompt override, so the catalog worker's
+own scene template is used instead of a subjectless stub.
 
 The public `ResolvedSelfiePrompt` object carries the exact values that must be
 sent to the image worker, including seed, dimensions, inference steps, and
