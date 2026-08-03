@@ -1,11 +1,11 @@
 """Tests for VisualIdentityFeature (extracted package)."""
 
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
+
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
-
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
-
 
 # =============================================================================
 # Fixtures
@@ -269,6 +269,7 @@ class _QueueProvider:
         self.provider_name = provider_name
         self.capabilities = _Capabilities(True)
         self.received_config = None
+        self.received_kwargs = None
         self.generate_calls = 0
 
     async def generate_image(self, config, **kwargs):
@@ -278,6 +279,7 @@ class _QueueProvider:
         )
 
         self.received_config = config
+        self.received_kwargs = kwargs
         self.generate_calls += 1
         # Enqueue accepted: no image yet, only a job handle to poll.
         return GenerationResult(
@@ -321,6 +323,227 @@ class _FakePool:
 
     def acquire(self):
         return _FakeAcquire(self._conn)
+
+
+class _FailedProvider:
+    """Provider double that records its config and rejects generation."""
+
+    provider_name = "catalog_worker"
+    capabilities = _Capabilities(True)
+
+    def __init__(self):
+        self.received_config = None
+
+    async def generate_image(self, config, **kwargs):
+        from kestrel_sovereign.features.training import (
+            GenerationResult,
+            GenerationState,
+        )
+
+        self.received_config = config
+        return GenerationResult(
+            job_id="queue-job-rejected",
+            state=GenerationState.FAILED,
+            images=[],
+            error="catalog rejected LoRA binding",
+        )
+
+
+class TestTrainedLoraContext:
+    """Authenticated context carried through the trained-LoRA route (#18)."""
+
+    @staticmethod
+    def _promoted_row():
+        return {
+            "image_url": "https://stored.example/avatar.png",
+            "did": "did:key:companion-123",
+            "avatar_config": {
+                "url": "https://older.example/avatar.png",
+                "lora_model_path": (
+                    "catalog://companions/comp-123/lora/sha256:promoted"
+                ),
+                "lora_ipfs_cid": "bafy-promoted-lora",
+                "trigger_word": "TOKPROMOTED",
+                "flux_version": "flux1",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_queue_receives_complete_trained_lora_context(
+        self, feature_standalone
+    ):
+        """The promoted-LoRA path uses the canonical config builder and a
+        queue acceptance remains an honest queued success with LoRA context."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._promoted_row())
+
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="beach",
+            reference_image="https://caller.example/untrusted-avatar.png",
+            companion_id="comp-123",
+            allow_training=False,
+            requested_by="user-9",
+        )
+
+        assert result.status is ToolResultStatus.OK
+        assert provider.generate_calls == 1
+        config = provider.received_config
+        assert config.prompt.startswith("A photo of TOKPROMOTED")
+        assert config.lora_path == (
+            "catalog://companions/comp-123/lora/sha256:promoted"
+        )
+        assert config.trigger_word == "TOKPROMOTED"
+        assert config.companion_id == "comp-123"
+        assert config.companion_did == "did:key:companion-123"
+        assert config.scene == "beach"
+        # The trained path carries only the server-owned avatar reference;
+        # caller input cannot replace it.
+        assert config.avatar_reference_url == "https://stored.example/avatar.png"
+        assert config.requested_by == "user-9"
+        assert provider.received_kwargs == {
+            "lora_ipfs_cid": "bafy-promoted-lora",
+            "flux_version": "flux1",
+        }
+
+        assert result.data["queued"] is True
+        assert result.data["job_id"] == "queue-job-42"
+        assert result.data["status"] == "pending"
+        assert result.data["companion_id"] == "comp-123"
+        assert result.data["used_lora"] is True
+        assert result.data["reference_used"] is False
+        assert "image_url" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_bound_agent_identity_wins_on_trained_lora_path(
+        self, feature_standalone
+    ):
+        """A prompt-injected owner cannot override the bound agent user, and
+        an equal tool companion is normalized to the host-owned identity."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._promoted_row())
+        bound_companion_id = UUID("00000000-0000-0000-0000-000000000123")
+
+        class _Agent:
+            def __init__(self):
+                self.companion_context = {
+                    "companion_id": bound_companion_id,
+                    "user_id": "bound-user-7",
+                }
+
+        feature.agent = _Agent()
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="cozy",
+            # Same identity, but from the tool boundary as a string. The
+            # authoritative host-owned UUID must be carried to the provider.
+            companion_id=str(bound_companion_id),
+            allow_training=False,
+            requested_by="attacker-supplied-user",
+        )
+
+        assert result.status is ToolResultStatus.OK
+        assert provider.received_config.companion_id is bound_companion_id
+        assert provider.received_config.requested_by == "bound-user-7"
+        assert provider.received_config.scene == "cozy"
+        assert result.data["used_lora"] is True
+
+    @pytest.mark.asyncio
+    async def test_standalone_requested_by_is_preserved_for_trained_lora(
+        self, feature_standalone
+    ):
+        """The trusted non-agent caller remains able to attribute the job."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._promoted_row())
+
+        provider = _FakeProvider("catalog_worker", supports_reference_image=True)
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="portrait",
+            companion_id="comp-123",
+            allow_training=False,
+            requested_by="authenticated-rest-user",
+        )
+
+        assert result.status is ToolResultStatus.OK
+        assert provider.received_config.requested_by == "authenticated-rest-user"
+        assert provider.received_config.companion_id == "comp-123"
+        assert result.data["used_lora"] is True
+
+    @pytest.mark.asyncio
+    async def test_rejected_trained_lora_request_never_claims_lora_use(
+        self, feature_standalone
+    ):
+        """A provider failure after receiving context is still a failure and
+        cannot emit the post-LoRA ``used_lora=true`` success marker."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._promoted_row())
+
+        provider = _FailedProvider()
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="beach",
+            companion_id="comp-123",
+            allow_training=False,
+            requested_by="user-9",
+        )
+
+        assert provider.received_config.companion_id == "comp-123"
+        assert provider.received_config.lora_path.endswith("sha256:promoted")
+        assert result.status is ToolResultStatus.ERROR
+        assert "catalog rejected LoRA binding" in result.error
+        assert not result.data or "used_lora" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_bound_companion_mismatch_stops_before_context_lookup(
+        self, feature_standalone
+    ):
+        """A tool-supplied companion cannot redirect a bound LoRA request."""
+        feature = feature_standalone
+        feature.enabled = True
+
+        class _Agent:
+            def __init__(self):
+                self.companion_context = {
+                    "companion_id": "bound-companion",
+                    "user_id": "bound-user",
+                }
+
+        feature.agent = _Agent()
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+
+        async def _lookup_must_not_run(*_args, **_kwargs):
+            raise AssertionError("tenant guard allowed a server-side lookup")
+
+        feature._lookup_companion_did = _lookup_must_not_run
+        feature._lookup_avatar_url = _lookup_must_not_run
+
+        result = await feature.generate_selfie(
+            scene="casual",
+            companion_id="different-companion",
+            lora_model_path="catalog://attacker/lora",
+            requested_by="different-user",
+            allow_training=False,
+        )
+
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["code"] == "companion_id_mismatch"
+        assert provider.generate_calls == 0
 
 
 class TestNoLoraReferenceRoute:

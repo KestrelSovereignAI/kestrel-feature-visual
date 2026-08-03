@@ -322,7 +322,11 @@ class VisualIdentityFeature(Feature):
         prompt: str,
         lora_path: str,
         trigger_word: str,
-        companion_id: str,
+        companion_id: Optional[str],
+        companion_did: Optional[str] = None,
+        scene: Optional[str] = None,
+        avatar_reference_url: Optional[str] = None,
+        requested_by: Optional[str] = None,
         lora_ipfs_cid: Optional[str] = None,
         provider_name: Optional[str] = None,
         flux_version: Optional[str] = None,
@@ -337,7 +341,11 @@ class VisualIdentityFeature(Feature):
             prompt: Generation prompt
             lora_path: Path to LoRA model (GCS path or local)
             trigger_word: LoRA trigger word
-            companion_id: Companion ID for logging
+            companion_id: Authenticated companion ID for provider attribution
+            companion_did: Server-resolved companion DID, when available
+            scene: Requested selfie scene
+            avatar_reference_url: Server-owned avatar reference, when available
+            requested_by: Authenticated requesting user, when available
             lora_ipfs_cid: Optional IPFS CID for LoRA (preferred over lora_path)
             provider_name: Optional specific provider to use ("runpod", "vertex_ai", etc.)
             flux_version: Optional FLUX version ("flux1" or "flux2") for container selection
@@ -360,10 +368,20 @@ class VisualIdentityFeature(Feature):
             )
 
         try:
-            config = GenerationConfig(
+            # This helper is the one construction path for both reference-image
+            # and trained-LoRA requests. Besides preserving compatibility with
+            # SDKs that predate the context fields, it prevents the LoRA path
+            # from silently dropping the authenticated companion/user context
+            # a catalog provider needs to bind the promoted active model.
+            config = self._build_generation_config(
                 prompt=prompt,
                 lora_path=lora_path,
                 trigger_word=trigger_word,
+                companion_id=companion_id,
+                companion_did=companion_did,
+                scene=scene,
+                avatar_reference_url=avatar_reference_url,
+                requested_by=requested_by,
             )
 
             # Log which LoRA source we're using
@@ -376,8 +394,32 @@ class VisualIdentityFeature(Feature):
             # Pass flux_version to select correct container (flux1 = uncensored, flux2 = standard)
             result = await training_provider.generate_image(config, lora_ipfs_cid=lora_ipfs_cid, flux_version=flux_version)
 
-            if result.state.value != "completed":
-                raise RuntimeError(f"Generation failed: {result.error or 'Unknown error'}")
+            state = getattr(result, "state", None)
+            state_value = getattr(state, "value", None)
+            job_id = getattr(result, "job_id", None)
+
+            if state_value == "failed":
+                raise RuntimeError(
+                    f"Generation failed: {result.error or 'Unknown error'}"
+                )
+
+            # A catalog provider accepts the authenticated LoRA request and
+            # renders it out-of-band. Queue acceptance is a usable result when
+            # it has a durable handle, just as it is on the reference path.
+            if state_value != "completed":
+                if not job_id:
+                    raise RuntimeError(
+                        "Generation did not complete and returned no job handle"
+                    )
+                return {
+                    "success": True,
+                    "images": [],
+                    "queued": True,
+                    "job_id": job_id,
+                    "status": state_value,
+                    "backend": training_provider.provider_name,
+                    "elapsed_seconds": getattr(result, "elapsed_seconds", None),
+                }
 
             if not result.images:
                 raise RuntimeError("Generation completed but no images returned")
@@ -387,6 +429,9 @@ class VisualIdentityFeature(Feature):
             return {
                 "success": True,
                 "images": result.images,
+                "queued": False,
+                "job_id": job_id,
+                "status": state_value,
                 "backend": training_provider.provider_name,
                 "elapsed_seconds": result.elapsed_seconds,
             }
@@ -826,10 +871,10 @@ Looking good! Want another one in a different style?"
             provider: Force specific provider (runpod, vertex_ai, vastai). None = auto-select.
             requested_by: Authenticated user id to attribute the job to. Set by
                 REST callers (which have no agent.companion_context); propagated
-                into ``GenerationConfig.requested_by`` on the no-LoRA route so a
-                queue-based provider records the real user id instead of a
-                sentinel. When omitted, falls back to the agent context's
-                ``user_id`` on the chat path.
+                into ``GenerationConfig.requested_by`` on both the reference
+                and trained-LoRA routes so a queue-based provider records the
+                real user id instead of a sentinel. When omitted, falls back to
+                the agent context's ``user_id`` on the chat path.
 
         Returns:
             ``ToolResult.ok(confirmation, data={image_url, scene, used_lora,
@@ -843,11 +888,19 @@ Looking good! Want another one in a different style?"
                 "Image generation not available (no providers configured)"
             )
 
+        # Bind tenant identity once, before either generation route. Tool
+        # arguments are LLM-controlled; a bound agent's companion/user context
+        # is authoritative. The standalone server path has no bound context,
+        # so it may carry an explicitly authenticated ``requested_by`` value.
+        companion_context = None
+        if self.agent and hasattr(self.agent, "companion_context"):
+            raw_context = getattr(self.agent, "companion_context", None)
+            companion_context = raw_context if isinstance(raw_context, dict) else {}
+
         # AUTO-FILL companion_id from agent's companion_context if not provided
         # This enables "send me a selfie" to work without the user providing IDs
-        if not companion_id and self.agent and hasattr(self.agent, 'companion_context'):
-            companion_context = getattr(self.agent, 'companion_context', {})
-            companion_id = companion_context.get('companion_id')
+        if not companion_id and companion_context is not None:
+            companion_id = companion_context.get("companion_id")
             if companion_id:
                 logger.info(f"Auto-filled companion_id from agent context: {companion_id}")
 
@@ -860,9 +913,8 @@ Looking good! Want another one in a different style?"
         # authoritative for the multi-tenant chat path. Callers without
         # an agent context (batch jobs / admin scripts) are unaffected —
         # they're already trusted server-side callers by construction.
-        if companion_id and self.agent and hasattr(self.agent, "companion_context"):
-            ctx = getattr(self.agent, "companion_context", {}) or {}
-            bound_id = ctx.get("companion_id")
+        if companion_id and companion_context is not None:
+            bound_id = companion_context.get("companion_id")
             if bound_id and str(companion_id) != str(bound_id):
                 logger.warning(
                     "generate_selfie companion_id=%s does not match agent "
@@ -873,6 +925,28 @@ Looking good! Want another one in a different style?"
                     "companion_id does not match the active companion context",
                     data={"code": "companion_id_mismatch", "status_code": 403},
                 )
+            if bound_id:
+                # Keep the host-owned value, not the merely-equal tool value,
+                # as the identity sent through all subsequent lookups/config.
+                companion_id = bound_id
+
+        if companion_context is not None:
+            requested_by = companion_context.get("user_id") or None
+
+        # Resolve provider context only from server-owned companion state. The
+        # caller-supplied ``reference_image`` remains eligible solely for the
+        # explicitly guarded no-LoRA route; it can never replace the avatar
+        # reference carried with a trained-LoRA request.
+        companion_did = (
+            await self._lookup_companion_did(companion_id)
+            if companion_id
+            else None
+        )
+        server_avatar_reference_url = (
+            await self._lookup_avatar_url(companion_id)
+            if companion_id
+            else None
+        )
 
         scene = scene.lower()
         scene_description = self.SCENE_PROMPTS.get(scene, self.SCENE_PROMPTS["casual"])
@@ -975,7 +1049,7 @@ Looking good! Want another one in a different style?"
                         # 169.254.169.254 metadata endpoints via the
                         # unvalidated `reference_image` sink.
                         avatar_reference_url := (
-                            await self._lookup_avatar_url(companion_id)
+                            server_avatar_reference_url
                             or (
                                 reference_image
                                 if _reference_url_is_safe(reference_image)
@@ -1000,25 +1074,6 @@ Looking good! Want another one in a different style?"
                             .replace("TRIGGER_WORD", "")
                             .strip()
                         )
-                        companion_did = await self._lookup_companion_did(companion_id)
-                        # Tenant-scoping precedence (codex round-2 P1 on #12):
-                        # `generate_selfie` is an @tool, so every kwarg is
-                        # LLM-controllable via prompt injection. If we let a
-                        # caller-supplied `requested_by` win when an agent
-                        # context is bound, a prompt-injected chat message
-                        # could attribute the queued job to another user's
-                        # ID and let that user's dashboard poll find it —
-                        # cross-tenant job leak. So: when self.agent has a
-                        # companion_context (chat path), we ALWAYS use its
-                        # user_id and IGNORE any tool-supplied
-                        # requested_by. Only the standalone REST path (no
-                        # agent context) honors the explicit param.
-                        if self.agent and hasattr(
-                            self.agent, "companion_context"
-                        ):
-                            requested_by = getattr(
-                                self.agent, "companion_context", {}
-                            ).get("user_id") or None
                         return await self._generate_via_reference_image(
                             provider=reference_provider,
                             prompt=reference_prompt,
@@ -1079,29 +1134,55 @@ Looking good! Want another one in a different style?"
                                 prompt=final_prompt,
                                 lora_path=lora_model_path,
                                 trigger_word=trigger_word,
-                                companion_id=companion_id or "unknown",
+                                companion_id=companion_id,
+                                companion_did=companion_did,
+                                scene=scene,
+                                avatar_reference_url=server_avatar_reference_url,
+                                requested_by=requested_by,
                                 lora_ipfs_cid=lora_ipfs_cid,  # Pass IPFS CID (preferred)
                                 provider_name=provider,  # Pass explicit provider selection
                                 flux_version=flux_version,  # "flux1" or "flux2" for container selection
                             )
-                            if result.get("success") and result.get("images"):
-                                return ToolResult.ok(
-                                    confirmation=(
-                                        f"Generated selfie (scene: {scene}, "
-                                        f"trained_this_request: {trained_this_request})"
-                                    ),
-                                    data={
-                                        "image_url": result["images"][0],
-                                        "scene": scene,
-                                        "prompt": final_prompt,  # for gallery storage
-                                        "used_lora": True,
-                                        "trained_this_request": trained_this_request,
-                                        "reference_used": False,
-                                        "backend": result.get("backend", "provider"),
-                                        "elapsed_seconds": result.get("elapsed_seconds"),
-                                        "lora_source": "ipfs" if lora_ipfs_cid else "gcs",
-                                    },
-                                )
+                            if result.get("success"):
+                                lora_result = {
+                                    "scene": scene,
+                                    "prompt": final_prompt,
+                                    # This marker is emitted only after the
+                                    # provider accepted the canonical config
+                                    # carrying this companion's LoRA context.
+                                    "used_lora": True,
+                                    "trained_this_request": trained_this_request,
+                                    "reference_used": False,
+                                    "backend": result.get("backend", "provider"),
+                                    "elapsed_seconds": result.get("elapsed_seconds"),
+                                    "lora_source": "ipfs" if lora_ipfs_cid else "gcs",
+                                }
+                                if result.get("images"):
+                                    return ToolResult.ok(
+                                        confirmation=(
+                                            f"Generated selfie (scene: {scene}, "
+                                            f"trained_this_request: "
+                                            f"{trained_this_request})"
+                                        ),
+                                        data={
+                                            **lora_result,
+                                            "image_url": result["images"][0],
+                                        },
+                                    )
+                                if result.get("queued"):
+                                    return ToolResult.ok(
+                                        confirmation=(
+                                            f"Queued selfie (scene: {scene}, "
+                                            "trained LoRA identity)"
+                                        ),
+                                        data={
+                                            **lora_result,
+                                            "queued": True,
+                                            "job_id": result.get("job_id"),
+                                            "status": result.get("status"),
+                                            "companion_id": companion_id,
+                                        },
+                                    )
                         except RuntimeError as e:
                             logger.error(f"Provider generation failed: {e}")
                             return ToolResult.failed(

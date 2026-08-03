@@ -32,7 +32,7 @@ classifiers = [
     "Topic :: Multimedia :: Graphics",
 ]
 dependencies = [
-    # The no-LoRA reference-image route populates companion-context fields
+    # Both reference-image and trained-LoRA routes populate companion context
     # (companion_id/companion_did/scene/avatar_reference_url/...) on
     # GenerationConfig. These land natively in a later SDK; until then
     # ``_build_generation_config`` sets them forward-compatibly as attributes
