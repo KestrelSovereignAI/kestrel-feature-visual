@@ -1286,3 +1286,52 @@ class TestReferenceRoutePromptShape:
         assert SELFIE_SCENE_PROMPTS["beach"] in config.prompt
         assert "TRIGGER_WORD" not in config.prompt
         assert "A photo of ." not in config.prompt
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t "])
+    @pytest.mark.asyncio
+    async def test_blank_custom_prompt_is_absent_on_the_reference_route_too(
+        self, feature_standalone, blank
+    ):
+        """The route must not re-decide "supplied" differently from the resolver.
+
+        resolve_selfie_prompt treats a blank custom prompt as absent, so
+        deciding it again with raw truthiness sent a subjectless override for
+        an unknown scene — the catalog worker honours prompt_override
+        unconditionally, so its scene template never ran.
+        """
+        result, config = await self._run(
+            feature_standalone, "shower", custom_prompt=blank
+        )
+
+        assert result.status is ToolResultStatus.OK, result.error
+        assert not config.prompt
+        assert "A photo of ." not in (config.prompt or "")
+
+    @pytest.mark.parametrize(
+        "style, marker",
+        [("anime", "anime style illustration"), ("artistic", "artistic portrait")],
+    )
+    @pytest.mark.asyncio
+    async def test_reference_route_keeps_the_style_prefix(
+        self, feature_standalone, style, marker
+    ):
+        """origin/main applied the style prefix here; rebuilding the prompt by
+        hand silently dropped it while the gallery row still recorded the
+        requested style."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = None
+        provider = _FakeProvider("catalog_worker", supports_reference_image=True)
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        async def _fake_lookup(_cid):
+            return "https://avatar.example/a.png"
+
+        feature._lookup_avatar_url = _fake_lookup
+        result = await feature.generate_selfie(
+            scene="beach", style=style, companion_id="comp-123", allow_training=False
+        )
+
+        assert result.status is ToolResultStatus.OK, result.error
+        assert provider.received_config.prompt.startswith(marker)

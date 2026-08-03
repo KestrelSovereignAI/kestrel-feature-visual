@@ -42,6 +42,8 @@ SELFIE_SCENE_PROMPTS: Mapping[str, str] = MappingProxyType(
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+@-]{0,254}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 DESCRIPTOR_MAX_LENGTH = 128
+DEFAULT_SCENE = "casual"
+DEFAULT_STYLE = "photorealistic"
 
 
 def normalize_descriptor(value: str) -> str:
@@ -112,6 +114,22 @@ def is_valid_trigger_word(value: object) -> bool:
         and value[0].isalnum()
         and _CONTROL_RE.search(value) is None
     )
+
+
+def prompt_without_trigger(resolved: ResolvedSelfiePrompt) -> str:
+    """Return the resolved prompt with its single trigger binding removed.
+
+    The no-LoRA reference route needs the prompt minus the trigger. Deriving
+    it here - from the same pattern that guarantees the binding is exactly
+    once - keeps prompt shape owned in one place. Rebuilding it by hand in the
+    caller silently dropped the style prefix and broke whenever the shape
+    changed.
+    """
+    marker = "\x00"
+    text = _trigger_pattern(resolved.trigger_word).sub(marker, resolved.prompt, count=1)
+    text = re.sub(rf"{marker},\s*", "", text, count=1)
+    text = re.sub(rf",\s*{marker}", "", text, count=1)
+    return " ".join(text.replace(marker, "").split())
 
 
 def _trigger_pattern(trigger_word: str) -> re.Pattern[str]:
@@ -262,8 +280,8 @@ class ResolvedLoraSelfieSpec:
 
 def resolve_selfie_prompt(
     *,
-    scene: str,
-    style: str,
+    scene: str | None,
+    style: str | None,
     custom_prompt: str | None,
     trigger_word: str,
     seed: int = 0,
@@ -275,8 +293,10 @@ def resolve_selfie_prompt(
 ) -> ResolvedSelfiePrompt:
     """Resolve one final prompt using the same rules for quote and execution."""
 
-    if not isinstance(scene, str) or not isinstance(style, str):
-        raise TypeError("selfie scene and style must be strings")
+    if scene is not None and not isinstance(scene, str):
+        raise TypeError("selfie scene must be a string")
+    if style is not None and not isinstance(style, str):
+        raise TypeError("selfie style must be a string")
     if custom_prompt is not None and not isinstance(custom_prompt, str):
         raise TypeError("selfie custom prompt must be a string")
     # An empty or whitespace-only custom prompt means "not supplied", as the
@@ -300,10 +320,14 @@ def resolve_selfie_prompt(
     # describe three different things and collapsed four distinct paid quotes
     # onto one digest. Only the descriptive prompt TEXT depends on the map:
     # an unknown scene contributes none rather than claiming to be "casual".
-    normalized_scene = normalize_descriptor(scene)
+    # An absent scene/style means "use the default", not "fail". frinz passes
+    # style through completely raw on both call paths, and an LLM emitting ""
+    # for an unused optional string is ordinary - the same reasoning already
+    # applied to custom_prompt.
+    normalized_scene = normalize_descriptor(scene or "") or DEFAULT_SCENE
     if not is_valid_descriptor(normalized_scene):
         raise ValueError("selfie scene is invalid")
-    normalized_style = normalize_descriptor(style)
+    normalized_style = normalize_descriptor(style or "") or DEFAULT_STYLE
     if not is_valid_descriptor(normalized_style):
         raise ValueError("selfie style is invalid")
     if not is_valid_trigger_word(trigger_word):
@@ -377,8 +401,8 @@ def resolve_selfie_prompt(
 
 def resolve_lora_selfie_spec(
     *,
-    scene: str,
-    style: str,
+    scene: str | None,
+    style: str | None,
     custom_prompt: str | None,
     trigger_word: str,
     lora_version_id: str,

@@ -405,3 +405,31 @@ def test_scene_is_normalized_before_it_reaches_any_consumer() -> None:
     assert prompt.scene == "beach"
     assert spec.scene == "beach"
     assert spec.spec_sha256 == _lora_spec(scene="beach")[1].spec_sha256
+
+
+@pytest.mark.parametrize("blank", ["", "   ", None])
+def test_absent_scene_or_style_uses_the_documented_default(blank) -> None:
+    """origin/main served these; frinz forwards style completely raw.
+
+    ``{"style": ""}`` from an unvalidated body field, or an LLM emitting "" for
+    an unused optional argument, must not 500 the request.
+    """
+    baseline = resolve_selfie_prompt(
+        scene="casual",
+        style="photorealistic",
+        custom_prompt=None,
+        trigger_word="TOKluna",
+    )
+    for field in ("scene", "style"):
+        resolved = resolve_selfie_prompt(
+            **{
+                "scene": "casual",
+                "style": "photorealistic",
+                "custom_prompt": None,
+                "trigger_word": "TOKluna",
+                field: blank,
+            }
+        )
+        assert resolved.prompt == baseline.prompt
+        assert resolved.scene == "casual"
+        assert resolved.style == "photorealistic"

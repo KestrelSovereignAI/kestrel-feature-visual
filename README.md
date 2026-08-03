@@ -42,9 +42,15 @@ rendering as `casual`, and an unrecognized style adds no prefix. The scene reads
 same on the resolved prompt, the generation config, the returned result, and
 `spec_sha256`, so two different scenes can never share a digest.
 
+An absent `scene` or `style` — `None`, `""`, or whitespace — means "use the default"
+(`casual` / `photorealistic`), not "fail". frinz forwards `style` completely raw from
+both an unvalidated body field and an LLM tool argument.
+
 On the no-LoRA reference route, when there is neither a custom prompt nor a known
 scene description this package sends **no** prompt override, so the catalog worker's
-own scene template is used instead of a subjectless stub.
+own scene template is used instead of a subjectless stub. Otherwise the route uses
+`prompt_without_trigger()`, which derives the trigger-free text from the resolved
+prompt itself — rebuilding it in the caller silently dropped the style prefix.
 
 The public `ResolvedSelfiePrompt` object carries the exact values that must be
 sent to the image worker, including seed, dimensions, inference steps, and

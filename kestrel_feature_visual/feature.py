@@ -36,6 +36,7 @@ import httpx
 from .selfie_spec import (
     SELFIE_SCENE_PROMPTS,
     ResolvedSelfiePrompt,
+    prompt_without_trigger,
     resolve_selfie_prompt,
 )
 
@@ -1093,19 +1094,19 @@ Looking good! Want another one in a different style?"
                         # say: send an empty override so the catalog worker's
                         # own scene template wins instead of a subjectless
                         # "A photo of ..." stub.
-                        if custom_prompt:
-                            reference_prompt = (
-                                base_prompt.replace("TRIGGER_WORD, ", "")
-                                .replace("TRIGGER_WORD", "")
-                                .strip()
-                            )
-                        elif SELFIE_SCENE_PROMPTS.get(prompt_template.scene):
-                            reference_prompt = (
-                                f"A photo of "
-                                f"{SELFIE_SCENE_PROMPTS[prompt_template.scene]}. "
-                                "High quality, photorealistic, 8k."
-                            )
+                        # "Supplied" must mean the same thing it means to the
+                        # resolver: a blank custom prompt is *absent*, not a
+                        # prompt. Deciding it again with raw truthiness sent a
+                        # subjectless override for custom_prompt="   ".
+                        has_custom_prompt = bool(custom_prompt and custom_prompt.strip())
+                        if has_custom_prompt or SELFIE_SCENE_PROMPTS.get(
+                            prompt_template.scene
+                        ):
+                            reference_prompt = prompt_without_trigger(prompt_template)
                         else:
+                            # Nothing useful to say about this scene: send no
+                            # override so the catalog worker's own scene
+                            # template wins rather than a subjectless stub.
                             reference_prompt = ""
                         return await self._generate_via_reference_image(
                             provider=reference_provider,
