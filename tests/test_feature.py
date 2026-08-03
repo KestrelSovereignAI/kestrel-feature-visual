@@ -185,8 +185,6 @@ class TestGenerateSelfie:
         [
             ({"style": "cinematic"}, "style is unsupported"),
             ({"style": "realistic"}, "style is unsupported"),
-            ({"custom_prompt": ""}, "custom prompt is empty or too long"),
-            ({"custom_prompt": "   "}, "custom prompt is empty or too long"),
             (
                 {"custom_prompt": "TRIGGER_WORD next to TRIGGER_WORD"},
                 "bind the trigger once",

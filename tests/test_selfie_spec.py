@@ -8,6 +8,7 @@ import pytest
 
 from kestrel_feature_visual.selfie_spec import (
     ResolvedSelfiePrompt,
+    normalize_trigger_word,
     bind_lora_selfie_spec,
     resolve_lora_selfie_spec,
     resolve_selfie_prompt,
@@ -90,9 +91,8 @@ def test_custom_prompt_rejects_multiple_trigger_bindings(custom_prompt) -> None:
     ("changes", "field", "error_type"),
     [
         ({"style": "cinematic"}, "style", ValueError),
-        ({"trigger_word": " TOKluna"}, "trigger", ValueError),
-        ({"trigger_word": "TOKluna\n"}, "trigger", ValueError),
         ({"trigger_word": "-TOKluna"}, "trigger", ValueError),
+        ({"trigger_word": "   "}, "trigger", ValueError),
         ({"trigger_word": ""}, "trigger", ValueError),
         ({"lora_encrypted_sha256": "bad"}, "digest", ValueError),
         ({"lora_plaintext_sha256": "bad"}, "digest", ValueError),
@@ -263,7 +263,21 @@ def test_content_free_spec_revalidates_every_public_construction(
 
 @pytest.mark.parametrize(
     "companion_name",
-    ["Anna Marie", "Émilie", "O'Brien", "李小明", "Mary-Jane", "Luna"],
+    [
+        "Anna Marie",
+        "Émilie",
+        "O'Brien",
+        "李小明",
+        "Mary-Jane",
+        "Luna",
+        # The slice lands ON whitespace for these: TOK{name[:8]} yields a
+        # trailing space / embedded tab. Ordinary name shapes, and the exact
+        # case the first pass of this fix still rejected.
+        "Maria J Lopez",
+        "Jo Ann Smith",
+        "Mary\tJane",
+        "Li  Wei",
+    ],
 )
 def test_triggers_this_package_mints_are_accepted(companion_name) -> None:
     """Triggers are minted as ``TOK{companion_name[:8]}`` and persisted.
@@ -280,8 +294,10 @@ def test_triggers_this_package_mints_are_accepted(companion_name) -> None:
         custom_prompt=None,
         trigger_word=trigger,
     )
-    assert resolved.trigger_word == trigger
-    assert trigger in resolved.prompt
+    # Stored triggers are canonicalized the same way prompts are, so a slice
+    # that landed on whitespace still resolves instead of failing closed.
+    assert resolved.trigger_word == normalize_trigger_word(trigger)
+    assert resolved.trigger_word in resolved.prompt
 
 
 def test_trigger_binding_still_exact_for_a_trigger_containing_a_space() -> None:
@@ -301,4 +317,57 @@ def test_trigger_binding_still_exact_for_a_trigger_containing_a_space() -> None:
             style="photorealistic",
             custom_prompt=f"{trigger} beside {trigger}",
             trigger_word=trigger,
+        )
+
+
+@pytest.mark.parametrize("raw", [" TOKluna", "TOKluna ", "TOK  luna", "TOKluna\n"])
+def test_factory_canonicalizes_whitespace_but_the_type_demands_canonical_form(
+    raw,
+) -> None:
+    """Normalization belongs at the boundary; the type stays strict.
+
+    ``resolve_selfie_prompt`` accepts a stored trigger whose whitespace is
+    incidental and canonicalizes it. A directly constructed
+    ``ResolvedSelfiePrompt`` gets no such courtesy — it must already hold the
+    canonical form, so a digest can never attest an uncanonical variant.
+    """
+    resolved = resolve_selfie_prompt(
+        scene="casual",
+        style="photorealistic",
+        custom_prompt=None,
+        trigger_word=raw,
+    )
+    assert resolved.trigger_word == normalize_trigger_word(raw)
+
+    with pytest.raises(ValueError, match="trigger word is invalid"):
+        _direct_prompt(
+            resolved,
+            trigger_word=raw,
+            trigger_word_sha256=hashlib.sha256(raw.encode()).hexdigest(),
+        )
+
+
+def test_empty_custom_prompt_means_not_supplied() -> None:
+    """origin/main gated on ``if custom_prompt:``; "" must still make a selfie.
+
+    ``custom_prompt`` is an optional, undocumented parameter on an LLM-invoked
+    tool, and emitting "" for an unused optional string is common model
+    behavior. Treating it as a hard error turned the primary "send me a
+    selfie" path into a failure.
+    """
+    scene_only = resolve_selfie_prompt(
+        scene="casual",
+        style="photorealistic",
+        custom_prompt=None,
+        trigger_word="TOKluna",
+    )
+    for blank in ("", "   ", "\t\n "):
+        assert (
+            resolve_selfie_prompt(
+                scene="casual",
+                style="photorealistic",
+                custom_prompt=blank,
+                trigger_word="TOKluna",
+            ).prompt
+            == scene_only.prompt
         )

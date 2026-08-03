@@ -47,27 +47,43 @@ _STYLES = frozenset({"photorealistic", "anime", "artistic"})
 TRIGGER_WORD_MAX_LENGTH = 128
 
 
-def is_valid_trigger_word(value: object) -> bool:
-    """Return whether ``value`` may be used as a LoRA trigger.
+def normalize_trigger_word(value: str) -> str:
+    """Collapse whitespace runs exactly as ``_normalize_prompt`` does.
 
-    Deliberately permissive about the character set. Triggers are minted from
-    the companion name (``TOK{name[:8]}``) and persisted alongside a LoRA that
-    was *trained* on that exact token, so a name containing a space, an
-    apostrophe, or a non-ASCII letter yields a trigger that already exists in
-    the database and cannot be rewritten without invalidating the trained
-    weights. Rejecting those would permanently break every selfie for the
-    affected companions.
+    Triggers are minted as ``TOK{companion_name[:8]}``, and that slice lands
+    wherever it lands: "Maria J Lopez" yields ``'TOKMaria J '`` with a trailing
+    space, and "Mary\\tJane" yields ``'TOKMary\\tJan'`` with an embedded tab.
+    Those values are already persisted next to LoRAs trained on them, so they
+    must keep working.
+
+    Normalizing the trigger with the same rule applied to the prompt keeps the
+    two sides comparable — a trigger written into a custom prompt normalizes
+    identically, so the exactly-once binding stays well defined. It is also
+    tokenizer-inert: collapsing a trailing or doubled space does not change
+    what the model sees.
+    """
+    return " ".join(value.split())
+
+
+def is_valid_trigger_word(value: object) -> bool:
+    """Return whether ``value`` is a usable, canonical LoRA trigger.
+
+    Deliberately permissive about the character set. A companion named
+    "Anna Marie", "Émilie", or "O'Brien" has a stored trigger containing a
+    space, a non-ASCII letter, or an apostrophe, and the LoRA was *trained* on
+    that exact token — it cannot be rewritten without invalidating the weights.
+    Rejecting those would permanently break every selfie for that companion.
 
     What is enforced is what the prompt contract actually depends on: a
-    non-empty, bounded, single-line token with no surrounding whitespace and no
-    control characters, beginning with an alphanumeric. Regex safety does not
-    depend on this — ``_trigger_pattern`` escapes the value.
+    non-empty, bounded, single-line token in canonical (whitespace-collapsed)
+    form, with no control characters, beginning with an alphanumeric. Regex
+    safety does not depend on this — ``_trigger_pattern`` escapes the value.
     """
     return (
         isinstance(value, str)
         and 1 <= len(value) <= TRIGGER_WORD_MAX_LENGTH
+        and value == normalize_trigger_word(value)
         and value[0].isalnum()
-        and value == value.strip()
         and _CONTROL_RE.search(value) is None
     )
 
@@ -237,8 +253,19 @@ def resolve_selfie_prompt(
         raise TypeError("selfie scene and style must be strings")
     if custom_prompt is not None and not isinstance(custom_prompt, str):
         raise TypeError("selfie custom prompt must be a string")
+    # An empty or whitespace-only custom prompt means "not supplied", as the
+    # `if custom_prompt:` gate on origin/main did. An LLM emitting "" for an
+    # unused optional argument must still get a scene selfie, not a hard error.
+    if custom_prompt is not None and not custom_prompt.strip():
+        custom_prompt = None
     if not isinstance(trigger_word, str):
         raise TypeError("LoRA trigger word is invalid")
+    # Canonicalize before validating. TOK{companion_name[:8]} slices wherever
+    # the name happens to fall, so persisted triggers legitimately carry a
+    # trailing space ("Maria J Lopez" -> 'TOKMaria J ') or an embedded tab
+    # ("Mary\tJane" -> 'TOKMary\tJan'). Those LoRAs are already trained; the
+    # same normalization is applied to prompts, so binding stays comparable.
+    trigger_word = normalize_trigger_word(trigger_word)
     normalized_scene = scene.strip().lower()
     normalized_style = style.strip().lower()
     if normalized_scene not in SELFIE_SCENE_PROMPTS:
