@@ -7,6 +7,7 @@ from decimal import Decimal
 import pytest
 
 from kestrel_feature_visual.selfie_spec import (
+    SELFIE_SCENE_PROMPTS,
     ResolvedSelfiePrompt,
     normalize_trigger_word,
     bind_lora_selfie_spec,
@@ -246,7 +247,8 @@ def test_content_free_spec_rejects_a_forged_digest() -> None:
     ("field", "value", "error"),
     (
         ("schema_version", 2, "schema version"),
-        ("scene", "unknown", "scene"),
+        ("scene", "Unknown Scene", "scene"),
+        ("scene", "-leading-dash", "scene"),
         ("lora_version_id", "bad value", "LoRA version id"),
         ("lora_encrypted_sha256", "bad", "encrypted LoRA digest"),
         ("width", 1025, "width"),
@@ -371,3 +373,35 @@ def test_empty_custom_prompt_means_not_supplied() -> None:
             ).prompt
             == scene_only.prompt
         )
+
+
+@pytest.mark.parametrize("scene", ["shower", "bedroom", "spread_eagle"])
+def test_unknown_scene_is_preserved_and_distinguishes_the_digest(scene) -> None:
+    """A scene this package cannot describe is still the scene that was asked for.
+
+    frinz tier-gates these as paid sovereign content, routes them to a
+    different render engine, coalesces queued work on (companion_did, scene),
+    and names the stored asset by scene. Coercing them to "casual" made the
+    prompt, the config, and spec_sha256 describe three different things — and
+    collapsed four distinct paid quotes onto a single digest.
+    """
+    assert scene not in SELFIE_SCENE_PROMPTS
+
+    prompt, spec = _lora_spec(scene=scene)
+    assert prompt.scene == scene
+    assert spec.scene == scene
+
+    # No invented description: the prompt does not claim to be a casual selfie.
+    assert SELFIE_SCENE_PROMPTS["casual"] not in prompt.prompt
+    assert prompt.prompt.count(prompt.trigger_word) == 1
+
+    # And the digest actually distinguishes it from the coerced-to value.
+    assert spec.spec_sha256 != _lora_spec(scene="casual")[1].spec_sha256
+
+
+def test_scene_is_normalized_before_it_reaches_any_consumer() -> None:
+    """Downstream lookups are exact-match, so whitespace/case must not leak."""
+    prompt, spec = _lora_spec(scene="  BeAcH  ")
+    assert prompt.scene == "beach"
+    assert spec.scene == "beach"
+    assert spec.spec_sha256 == _lora_spec(scene="beach")[1].spec_sha256

@@ -329,7 +329,6 @@ class VisualIdentityFeature(Feature):
         lora_path: str,
         companion_id: Optional[str],
         companion_did: Optional[str] = None,
-        scene: Optional[str] = None,
         avatar_reference_url: Optional[str] = None,
         requested_by: Optional[str] = None,
         lora_ipfs_cid: Optional[str] = None,
@@ -347,8 +346,6 @@ class VisualIdentityFeature(Feature):
             lora_path: Path to LoRA model (GCS path or local)
             companion_id: Authenticated companion ID for provider attribution
             companion_did: Server-resolved companion DID, when available
-            scene: Scene as the caller requested it, before this package's
-                prompt map coerces an unrecognized value
             avatar_reference_url: Server-owned avatar reference, when available
             requested_by: Authenticated requesting user, when available
             lora_ipfs_cid: Optional IPFS CID for LoRA (preferred over lora_path)
@@ -396,15 +393,10 @@ class VisualIdentityFeature(Feature):
                 seed=resolved_prompt.seed,
                 companion_id=companion_id,
                 companion_did=companion_did,
-                # The CALLER's scene, not resolved_prompt.scene.
-                # SELFIE_SCENE_PROMPTS is a subset of the vocabulary downstream
-                # consumers use: frinz routes "shower"/"bedroom"/"spread_eagle"
-                # to a different render engine, coalesces queued work on
-                # (companion_did, scene), and names the stored asset by it.
-                # resolve_selfie_prompt coerces an unknown scene to "casual"
-                # for prompt TEXT only; propagating that coercion here would
-                # misroute paid requests and collapse two distinct jobs.
-                scene=scene if scene is not None else resolved_prompt.scene,
+                # resolve_selfie_prompt no longer swaps the scene, so this is
+                # the caller's own normalized value — the same one the prompt
+                # and spec digest describe.
+                scene=resolved_prompt.scene,
                 style=resolved_prompt.style,
                 resolved_prompt_sha256=resolved_prompt.prompt_sha256,
                 avatar_reference_url=avatar_reference_url,
@@ -1012,14 +1004,11 @@ Looking good! Want another one in a different style?"
         except (ValueError, TypeError) as e:
             return ToolResult.failed(str(e), data={"companion_id": companion_id})
         base_prompt = prompt_template.prompt
-        # NOTE: ``scene`` deliberately keeps the caller's value rather than
-        # ``prompt_template.scene``.  ``SELFIE_SCENE_PROMPTS`` is a subset of
-        # the vocabulary downstream consumers use — frinz routes "shower",
-        # "bedroom", and "spread_eagle" to a different render engine, coalesces
-        # queued work on (companion_did, scene), and stores assets under that
-        # key — so substituting the coerced "casual" here would misroute paid
-        # requests, collapse two distinct jobs onto one, and file the result
-        # under the wrong scene.
+        # One normalized scene everywhere: the resolver preserves the caller's
+        # value (it only declines to invent descriptive text for a scene it
+        # does not know), and downstream exact-match lookups in frinz key on
+        # this, so the untrimmed argument must not leak into the result.
+        scene = prompt_template.scene
         if custom_prompt:
             logger.info(f"Using custom prompt: {custom_prompt[:80]}...")
         else:
@@ -1183,7 +1172,6 @@ Looking good! Want another one in a different style?"
                                 lora_path=lora_model_path,
                                 companion_id=companion_id,
                                 companion_did=companion_did,
-                                scene=scene,
                                 avatar_reference_url=server_avatar_reference_url,
                                 requested_by=requested_by,
                                 lora_ipfs_cid=lora_ipfs_cid,  # Pass IPFS CID (preferred)

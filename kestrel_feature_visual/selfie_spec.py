@@ -41,6 +41,7 @@ SELFIE_SCENE_PROMPTS: Mapping[str, str] = MappingProxyType(
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+@-]{0,254}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_SCENE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _STYLES = frozenset({"photorealistic", "anime", "artistic"})
 
@@ -111,7 +112,7 @@ class ResolvedSelfiePrompt:
     guidance_scale: Decimal
 
     def __post_init__(self) -> None:
-        if self.scene not in SELFIE_SCENE_PROMPTS:
+        if not isinstance(self.scene, str) or not _SCENE_RE.fullmatch(self.scene):
             raise ValueError("resolved selfie prompt scene is invalid")
         if self.style not in _STYLES:
             raise ValueError("resolved selfie prompt style is invalid")
@@ -177,7 +178,7 @@ class ResolvedLoraSelfieSpec:
     def __post_init__(self) -> None:
         if self.schema_version != SELFIE_SPEC_SCHEMA_VERSION:
             raise ValueError("selfie spec schema version is unsupported")
-        if self.scene not in SELFIE_SCENE_PROMPTS:
+        if not isinstance(self.scene, str) or not _SCENE_RE.fullmatch(self.scene):
             raise ValueError("selfie spec scene is invalid")
         if self.style not in _STYLES:
             raise ValueError("selfie spec style is invalid")
@@ -266,10 +267,18 @@ def resolve_selfie_prompt(
     # ("Mary\tJane" -> 'TOKMary\tJan'). Those LoRAs are already trained; the
     # same normalization is applied to prompts, so binding stays comparable.
     trigger_word = normalize_trigger_word(trigger_word)
+    # The caller's scene is preserved, never silently swapped for another.
+    # SELFIE_SCENE_PROMPTS is a subset of the vocabulary downstream consumers
+    # use (frinz tier-gates "shower"/"bedroom"/"spread_eagle", routes them to a
+    # different engine, coalesces on it, and names the stored asset by it), so
+    # coercing it here made config.scene, config.prompt and spec_sha256
+    # describe three different things and collapsed four distinct paid quotes
+    # onto one digest. Only the descriptive prompt TEXT depends on the map:
+    # an unknown scene contributes none rather than claiming to be "casual".
     normalized_scene = scene.strip().lower()
+    if not _SCENE_RE.fullmatch(normalized_scene):
+        raise ValueError("selfie scene is invalid")
     normalized_style = style.strip().lower()
-    if normalized_scene not in SELFIE_SCENE_PROMPTS:
-        normalized_scene = "casual"
     if normalized_style not in _STYLES:
         raise ValueError("selfie style is unsupported")
     if not is_valid_trigger_word(trigger_word):
@@ -302,9 +311,12 @@ def resolve_selfie_prompt(
                 else f"{trigger_word}, {normalized_custom}"
             )
     else:
+        scene_text = SELFIE_SCENE_PROMPTS.get(normalized_scene)
         prompt = (
-            f"A photo of {trigger_word}, {SELFIE_SCENE_PROMPTS[normalized_scene]}. "
+            f"A photo of {trigger_word}, {scene_text}. "
             "High quality, photorealistic, 8k."
+            if scene_text
+            else f"A photo of {trigger_word}. High quality, photorealistic, 8k."
         )
         if normalized_style == "anime":
             prompt = f"anime style illustration, {prompt}"
