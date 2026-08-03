@@ -35,6 +35,16 @@ sent to the image worker, including seed, dimensions, inference steps, and
 guidance scale. Providers must reject a reconstructed digest that differs from
 the accepted quote.
 
+The object re-validates its own invariants on construction, not only inside
+`resolve_selfie_prompt()`, because downstream consumers treat the type itself
+as the trust boundary. It therefore carries the plaintext `trigger_word`
+alongside `trigger_word_sha256` and verifies that the digest matches the
+trigger and that `prompt` binds that trigger **exactly once** as a whole token.
+A directly constructed instance attesting a trigger the prompt never binds — or
+binds twice — is rejected, so a valid `spec_sha256` can never describe a prompt
+that does not match it. Carrying the trigger in plaintext discloses nothing
+further: it is already contained verbatim in `prompt`.
+
 ## Dependencies
 
 - `kestrel-sovereign-sdk>=0.25.0,<1` — base `Feature`, `tool`, and `ToolCategory` interfaces

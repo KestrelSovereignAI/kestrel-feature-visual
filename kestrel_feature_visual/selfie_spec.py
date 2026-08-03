@@ -45,6 +45,11 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _STYLES = frozenset({"photorealistic", "anime", "artistic"})
 
 
+def _trigger_pattern(trigger_word: str) -> re.Pattern[str]:
+    """Match ``trigger_word`` as a whole token, never as a substring."""
+    return re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(trigger_word)}(?![A-Za-z0-9_-])")
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedSelfiePrompt:
     """Exact final prompt and generation knobs sent to an image provider."""
@@ -53,6 +58,7 @@ class ResolvedSelfiePrompt:
     style: str
     prompt: str
     prompt_sha256: str
+    trigger_word: str
     trigger_word_sha256: str
     seed: int
     num_outputs: int
@@ -75,7 +81,24 @@ class ResolvedSelfiePrompt:
         _validate_sha256(self.prompt_sha256, "prompt")
         if self.prompt_sha256 != _sha256_text(self.prompt):
             raise ValueError("resolved selfie prompt digest is inconsistent")
+        # The trigger binding is this type's whole point, so it is re-checked
+        # here rather than only inside ``resolve_selfie_prompt``.  Consumers
+        # (``bind_lora_selfie_spec``, and providers reconstructing this object
+        # per the README) treat the type itself as the trust boundary: without
+        # this, a directly constructed instance could attest a
+        # ``trigger_word_sha256`` for a token the prompt never binds — or binds
+        # twice — and still produce a valid downstream ``spec_sha256``.  The
+        # plaintext trigger is already contained in ``prompt``, so carrying it
+        # discloses nothing the object did not already hold.
+        if not isinstance(self.trigger_word, str) or not _TRIGGER_RE.fullmatch(
+            self.trigger_word
+        ):
+            raise ValueError("resolved selfie prompt trigger word is invalid")
         _validate_sha256(self.trigger_word_sha256, "trigger word")
+        if self.trigger_word_sha256 != _sha256_text(self.trigger_word):
+            raise ValueError("resolved selfie prompt trigger digest is inconsistent")
+        if len(_trigger_pattern(self.trigger_word).findall(self.prompt)) != 1:
+            raise ValueError("resolved selfie prompt must bind the trigger once")
         _validate_generation_parameters(
             seed=self.seed,
             num_outputs=self.num_outputs,
@@ -210,9 +233,7 @@ def resolve_selfie_prompt(
     )
 
     normalized_custom = _normalize_prompt(custom_prompt)
-    trigger_pattern = re.compile(
-        rf"(?<![A-Za-z0-9_-]){re.escape(trigger_word)}(?![A-Za-z0-9_-])"
-    )
+    trigger_pattern = _trigger_pattern(trigger_word)
     if normalized_custom:
         placeholder_count = normalized_custom.count("TRIGGER_WORD")
         if placeholder_count > 1:
@@ -244,6 +265,7 @@ def resolve_selfie_prompt(
     return ResolvedSelfiePrompt(
         scene=normalized_scene,
         style=normalized_style,
+        trigger_word=trigger_word,
         prompt=prompt,
         prompt_sha256=_sha256_text(prompt),
         trigger_word_sha256=_sha256_text(trigger_word),

@@ -330,7 +330,6 @@ class VisualIdentityFeature(Feature):
         trigger_word: str,
         companion_id: Optional[str],
         companion_did: Optional[str] = None,
-        scene: Optional[str] = None,
         avatar_reference_url: Optional[str] = None,
         requested_by: Optional[str] = None,
         lora_ipfs_cid: Optional[str] = None,
@@ -349,7 +348,6 @@ class VisualIdentityFeature(Feature):
             trigger_word: LoRA trigger word
             companion_id: Authenticated companion ID for provider attribution
             companion_did: Server-resolved companion DID, when available
-            scene: Requested selfie scene
             avatar_reference_url: Server-owned avatar reference, when available
             requested_by: Authenticated requesting user, when available
             lora_ipfs_cid: Optional IPFS CID for LoRA (preferred over lora_path)
@@ -982,13 +980,28 @@ Looking good! Want another one in a different style?"
 
         # Resolve the placeholder form through the same pure function the
         # accepted-quote product path uses with the promoted LoRA trigger.
-        prompt_template = resolve_selfie_prompt(
-            scene=scene,
-            style=style,
-            custom_prompt=custom_prompt,
-            trigger_word="TRIGGER_WORD",
-        )
+        #
+        # ``scene``, ``style``, and ``custom_prompt`` are model-supplied tool
+        # arguments, so an unsupported style or a prompt that binds the trigger
+        # twice is ordinary bad input, not an internal fault.  Convert it to
+        # this tool's declared failure envelope instead of letting a ValueError
+        # escape a `-> ToolResult` method and strip the caller's structured
+        # data.
+        try:
+            prompt_template = resolve_selfie_prompt(
+                scene=scene,
+                style=style,
+                custom_prompt=custom_prompt,
+                trigger_word="TRIGGER_WORD",
+            )
+        except (ValueError, TypeError) as e:
+            return ToolResult.failed(str(e), data={"companion_id": companion_id})
         base_prompt = prompt_template.prompt
+        # Report the scene that was actually rendered. resolve_selfie_prompt
+        # coerces an unrecognized scene to "casual", so echoing the caller's
+        # raw argument back in the result would attest a scene the prompt never
+        # used — and any digest quoted alongside it would disagree.
+        scene = prompt_template.scene
         if custom_prompt:
             logger.info(f"Using custom prompt: {custom_prompt[:80]}...")
         else:
@@ -1139,7 +1152,6 @@ Looking good! Want another one in a different style?"
                                 trigger_word=trigger_word,
                                 companion_id=companion_id,
                                 companion_did=companion_did,
-                                scene=scene,
                                 avatar_reference_url=server_avatar_reference_url,
                                 requested_by=requested_by,
                                 lora_ipfs_cid=lora_ipfs_cid,  # Pass IPFS CID (preferred)

@@ -180,6 +180,39 @@ class TestGenerateSelfie:
         assert ("not available" in result.error.lower()
                 or "replicate" in result.error.lower())
 
+    @pytest.mark.parametrize(
+        "kwargs, expected",
+        [
+            ({"style": "cinematic"}, "style is unsupported"),
+            ({"style": "realistic"}, "style is unsupported"),
+            ({"custom_prompt": ""}, "custom prompt is empty or too long"),
+            ({"custom_prompt": "   "}, "custom prompt is empty or too long"),
+            (
+                {"custom_prompt": "TRIGGER_WORD next to TRIGGER_WORD"},
+                "bind the trigger once",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_invalid_prompt_arguments_fail_inside_the_tool_contract(
+        self, feature_standalone, kwargs, expected
+    ):
+        """Bad model-supplied arguments must not escape as raw exceptions.
+
+        ``style`` is advertised to the model as free-form text, so a
+        hallucinated value like "cinematic" is ordinary bad input. Raising out
+        of a ``-> ToolResult`` method strips the caller's structured envelope
+        and reaches the orchestrator as an unstructured failure.
+        """
+        # Past the availability guard so the prompt actually gets resolved.
+        feature_standalone.enabled = True
+
+        result = await feature_standalone.generate_selfie(scene="casual", **kwargs)
+
+        assert isinstance(result, ToolResult)
+        assert result.status is ToolResultStatus.ERROR
+        assert expected in result.error
+
 
 # =============================================================================
 # GenerationConfig companion-context helper
