@@ -61,6 +61,30 @@ class ResolvedSelfiePrompt:
     num_inference_steps: int
     guidance_scale: Decimal
 
+    def __post_init__(self) -> None:
+        if self.scene not in SELFIE_SCENE_PROMPTS:
+            raise ValueError("resolved selfie prompt scene is invalid")
+        if self.style not in _STYLES:
+            raise ValueError("resolved selfie prompt style is invalid")
+        if (
+            not isinstance(self.prompt, str)
+            or not self.prompt
+            or len(self.prompt) > 8_000
+        ):
+            raise ValueError("resolved selfie prompt text is invalid")
+        _validate_sha256(self.prompt_sha256, "prompt")
+        if self.prompt_sha256 != _sha256_text(self.prompt):
+            raise ValueError("resolved selfie prompt digest is inconsistent")
+        _validate_sha256(self.trigger_word_sha256, "trigger word")
+        _validate_generation_parameters(
+            seed=self.seed,
+            num_outputs=self.num_outputs,
+            width=self.width,
+            height=self.height,
+            num_inference_steps=self.num_inference_steps,
+            guidance_scale=self.guidance_scale,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ResolvedLoraSelfieSpec:
@@ -85,6 +109,41 @@ class ResolvedLoraSelfieSpec:
     num_inference_steps: int
     guidance_scale: Decimal
     spec_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SELFIE_SPEC_SCHEMA_VERSION:
+            raise ValueError("selfie spec schema version is unsupported")
+        if self.scene not in SELFIE_SCENE_PROMPTS:
+            raise ValueError("selfie spec scene is invalid")
+        if self.style not in _STYLES:
+            raise ValueError("selfie spec style is invalid")
+        for value, label in (
+            (self.lora_version_id, "LoRA version id"),
+            (self.base_model, "base model"),
+            (self.model_version, "model version"),
+            (self.trainer_version, "trainer version"),
+        ):
+            _validate_safe_id(value, label)
+        if self.flux_version is not None:
+            _validate_safe_id(self.flux_version, "FLUX version")
+        for value, label in (
+            (self.prompt_sha256, "prompt"),
+            (self.trigger_word_sha256, "trigger word"),
+            (self.lora_encrypted_sha256, "encrypted LoRA"),
+            (self.lora_plaintext_sha256, "plaintext LoRA"),
+        ):
+            _validate_sha256(value, label)
+        _validate_generation_parameters(
+            seed=self.seed,
+            num_outputs=self.num_outputs,
+            width=self.width,
+            height=self.height,
+            num_inference_steps=self.num_inference_steps,
+            guidance_scale=self.guidance_scale,
+        )
+        _validate_sha256(self.spec_sha256, "spec")
+        if self.spec_sha256 != _sha256_json(self.evidence_dict()):
+            raise ValueError("selfie spec digest is inconsistent")
 
     def evidence_dict(self) -> dict[str, object]:
         """Return the canonical content-free evidence covered by the digest."""
@@ -140,29 +199,20 @@ def resolve_selfie_prompt(
         raise ValueError("selfie style is unsupported")
     if not _TRIGGER_RE.fullmatch(trigger_word):
         raise ValueError("LoRA trigger word is invalid")
-    for value, label in (
-        (seed, "seed"),
-        (num_outputs, "num_outputs"),
-        (width, "width"),
-        (height, "height"),
-        (num_inference_steps, "inference steps"),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise TypeError(f"selfie {label} must be an integer")
-    if not 0 <= seed <= 4_294_967_295:
-        raise ValueError("selfie seed must be between 0 and 4294967295")
-    if not 1 <= num_outputs <= 4:
-        raise ValueError("selfie num_outputs must be between 1 and 4")
-    for value, label in ((width, "width"), (height, "height")):
-        if value < 256 or value > 4096 or value % 8:
-            raise ValueError(f"selfie {label} must be 256..4096 and divisible by 8")
-    if not 1 <= num_inference_steps <= 200:
-        raise ValueError("selfie inference steps must be between 1 and 200")
     guidance = _decimal(guidance_scale)
-    if guidance < Decimal(0) or guidance > Decimal(30):
-        raise ValueError("selfie guidance scale must be between 0 and 30")
+    _validate_generation_parameters(
+        seed=seed,
+        num_outputs=num_outputs,
+        width=width,
+        height=height,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance,
+    )
 
     normalized_custom = _normalize_prompt(custom_prompt)
+    trigger_pattern = re.compile(
+        rf"(?<![A-Za-z0-9_-]){re.escape(trigger_word)}(?![A-Za-z0-9_-])"
+    )
     if normalized_custom:
         placeholder_count = normalized_custom.count("TRIGGER_WORD")
         if placeholder_count > 1:
@@ -170,9 +220,6 @@ def resolve_selfie_prompt(
         if placeholder_count == 1:
             prompt = normalized_custom.replace("TRIGGER_WORD", trigger_word)
         else:
-            trigger_pattern = re.compile(
-                rf"(?<![A-Za-z0-9_-]){re.escape(trigger_word)}(?![A-Za-z0-9_-])"
-            )
             trigger_count = len(trigger_pattern.findall(normalized_custom))
             if trigger_count > 1:
                 raise ValueError("selfie custom prompt must bind the trigger once")
@@ -190,6 +237,9 @@ def resolve_selfie_prompt(
             prompt = f"anime style illustration, {prompt}"
         elif normalized_style == "artistic":
             prompt = f"artistic portrait painting style, {prompt}"
+
+    if len(trigger_pattern.findall(prompt)) != 1:
+        raise ValueError("selfie prompt must bind the trigger once")
 
     return ResolvedSelfiePrompt(
         scene=normalized_scene,
@@ -268,49 +318,8 @@ def bind_lora_selfie_spec(
     digest created at quote time. Prompt content remains transient.
     """
 
-    for value, label in (
-        (lora_version_id, "LoRA version id"),
-        (base_model, "base model"),
-        (model_version, "model version"),
-        (trainer_version, "trainer version"),
-    ):
-        if not _SAFE_ID_RE.fullmatch(value):
-            raise ValueError(f"selfie {label} is invalid")
-    if flux_version is not None and not _SAFE_ID_RE.fullmatch(flux_version):
-        raise ValueError("selfie FLUX version is invalid")
-    if not _SHA256_RE.fullmatch(lora_encrypted_sha256):
-        raise ValueError("selfie encrypted LoRA digest is invalid")
-    if not _SHA256_RE.fullmatch(lora_plaintext_sha256):
-        raise ValueError("selfie plaintext LoRA digest is invalid")
-    if (
-        resolved_prompt.scene not in SELFIE_SCENE_PROMPTS
-        or resolved_prompt.style not in _STYLES
-        or not resolved_prompt.prompt
-        or len(resolved_prompt.prompt) > 8_000
-        or resolved_prompt.prompt_sha256 != _sha256_text(resolved_prompt.prompt)
-        or not _SHA256_RE.fullmatch(resolved_prompt.trigger_word_sha256)
-        or any(
-            isinstance(value, bool) or not isinstance(value, int)
-            for value in (
-                resolved_prompt.seed,
-                resolved_prompt.num_outputs,
-                resolved_prompt.width,
-                resolved_prompt.height,
-                resolved_prompt.num_inference_steps,
-            )
-        )
-        or not isinstance(resolved_prompt.guidance_scale, Decimal)
-        or not resolved_prompt.guidance_scale.is_finite()
-        or not 0 <= resolved_prompt.seed <= 4_294_967_295
-        or not 1 <= resolved_prompt.num_outputs <= 4
-        or not 256 <= resolved_prompt.width <= 4096
-        or resolved_prompt.width % 8
-        or not 256 <= resolved_prompt.height <= 4096
-        or resolved_prompt.height % 8
-        or not 1 <= resolved_prompt.num_inference_steps <= 200
-        or not Decimal(0) <= resolved_prompt.guidance_scale <= Decimal(30)
-    ):
-        raise ValueError("resolved selfie prompt is invalid")
+    if not isinstance(resolved_prompt, ResolvedSelfiePrompt):
+        raise TypeError("resolved selfie prompt must use the canonical contract")
 
     evidence = {
         "schema_version": SELFIE_SPEC_SCHEMA_VERSION,
@@ -346,6 +355,55 @@ def _normalize_prompt(prompt: str | None) -> str | None:
     if not normalized or len(normalized) > 8_000:
         raise ValueError("selfie custom prompt is empty or too long")
     return normalized
+
+
+def _validate_safe_id(value: object, label: str) -> None:
+    if not isinstance(value, str):
+        raise TypeError(f"selfie {label} must be a string")
+    if not _SAFE_ID_RE.fullmatch(value):
+        raise ValueError(f"selfie {label} is invalid")
+
+
+def _validate_sha256(value: object, label: str) -> None:
+    if not isinstance(value, str):
+        raise TypeError(f"selfie {label} digest must be a string")
+    if not _SHA256_RE.fullmatch(value):
+        raise ValueError(f"selfie {label} digest is invalid")
+
+
+def _validate_generation_parameters(
+    *,
+    seed: object,
+    num_outputs: object,
+    width: object,
+    height: object,
+    num_inference_steps: object,
+    guidance_scale: object,
+) -> None:
+    for value, label in (
+        (seed, "seed"),
+        (num_outputs, "num_outputs"),
+        (width, "width"),
+        (height, "height"),
+        (num_inference_steps, "inference steps"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"selfie {label} must be an integer")
+    if not 0 <= seed <= 4_294_967_295:
+        raise ValueError("selfie seed must be between 0 and 4294967295")
+    if not 1 <= num_outputs <= 4:
+        raise ValueError("selfie num_outputs must be between 1 and 4")
+    for value, label in ((width, "width"), (height, "height")):
+        if value < 256 or value > 4096 or value % 8:
+            raise ValueError(f"selfie {label} must be 256..4096 and divisible by 8")
+    if not 1 <= num_inference_steps <= 200:
+        raise ValueError("selfie inference steps must be between 1 and 200")
+    if (
+        not isinstance(guidance_scale, Decimal)
+        or not guidance_scale.is_finite()
+        or not Decimal(0) <= guidance_scale <= Decimal(30)
+    ):
+        raise ValueError("selfie guidance scale must be between 0 and 30")
 
 
 def _decimal(value: Decimal | float | str) -> Decimal:

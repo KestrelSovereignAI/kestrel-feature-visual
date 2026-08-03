@@ -1,5 +1,6 @@
 """Canonical trained-LoRA selfie prompt and content-free binding tests."""
 
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -71,6 +72,7 @@ def test_custom_prompt_with_explicit_trigger_is_not_prefixed_again() -> None:
     (
         "TRIGGER_WORD beside TRIGGER_WORD",
         "TOKluna beside TOKluna",
+        "TRIGGER_WORD beside TOKluna",
     ),
 )
 def test_custom_prompt_rejects_multiple_trigger_bindings(custom_prompt) -> None:
@@ -145,29 +147,46 @@ def test_provider_can_rebind_the_exact_resolved_prompt() -> None:
     assert actual == expected
 
 
-def test_provider_rebind_rejects_a_tampered_prompt_digest() -> None:
-    prompt, expected = _lora_spec()
-    tampered = ResolvedSelfiePrompt(
-        scene=prompt.scene,
-        style=prompt.style,
-        prompt=prompt.prompt,
-        prompt_sha256="0" * 64,
-        trigger_word_sha256=prompt.trigger_word_sha256,
-        seed=prompt.seed,
-        num_outputs=prompt.num_outputs,
-        width=prompt.width,
-        height=prompt.height,
-        num_inference_steps=prompt.num_inference_steps,
-        guidance_scale=prompt.guidance_scale,
-    )
+def test_resolved_prompt_rejects_a_tampered_digest() -> None:
+    prompt, _expected = _lora_spec()
 
-    with pytest.raises(ValueError, match="resolved selfie prompt"):
-        bind_lora_selfie_spec(
-            resolved_prompt=tampered,
-            lora_version_id=expected.lora_version_id,
-            lora_encrypted_sha256=expected.lora_encrypted_sha256,
-            lora_plaintext_sha256=expected.lora_plaintext_sha256,
-            base_model=expected.base_model,
-            model_version=expected.model_version,
-            trainer_version=expected.trainer_version,
+    with pytest.raises(ValueError, match="prompt digest is inconsistent"):
+        ResolvedSelfiePrompt(
+            scene=prompt.scene,
+            style=prompt.style,
+            prompt=prompt.prompt,
+            prompt_sha256="0" * 64,
+            trigger_word_sha256=prompt.trigger_word_sha256,
+            seed=prompt.seed,
+            num_outputs=prompt.num_outputs,
+            width=prompt.width,
+            height=prompt.height,
+            num_inference_steps=prompt.num_inference_steps,
+            guidance_scale=prompt.guidance_scale,
         )
+
+
+def test_content_free_spec_rejects_a_forged_digest() -> None:
+    _prompt, expected = _lora_spec()
+
+    with pytest.raises(ValueError, match="spec digest is inconsistent"):
+        replace(expected, spec_sha256="0" * 64)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    (
+        ("schema_version", 2, "schema version"),
+        ("scene", "unknown", "scene"),
+        ("lora_version_id", "bad value", "LoRA version id"),
+        ("lora_encrypted_sha256", "bad", "encrypted LoRA digest"),
+        ("width", 1025, "width"),
+    ),
+)
+def test_content_free_spec_revalidates_every_public_construction(
+    field, value, error
+) -> None:
+    _prompt, expected = _lora_spec()
+
+    with pytest.raises((TypeError, ValueError), match=error):
+        replace(expected, **{field: value})
