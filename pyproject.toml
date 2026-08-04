@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-feature-visual"
-version = "0.3.1"
+version = "0.4.0"
 description = "Visual identity for Kestrel Sovereign agents — avatar generation, selfies, and LoRA training for character consistency"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -32,7 +32,7 @@ classifiers = [
     "Topic :: Multimedia :: Graphics",
 ]
 dependencies = [
-    # The no-LoRA reference-image route populates companion-context fields
+    # Both reference-image and trained-LoRA routes populate companion context
     # (companion_id/companion_did/scene/avatar_reference_url/...) on
     # GenerationConfig. These land natively in a later SDK; until then
     # ``_build_generation_config`` sets them forward-compatibly as attributes

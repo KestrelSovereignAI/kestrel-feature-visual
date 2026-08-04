@@ -33,6 +33,13 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .selfie_spec import (
+    SELFIE_SCENE_PROMPTS,
+    ResolvedSelfiePrompt,
+    prompt_without_trigger,
+    resolve_selfie_prompt,
+)
+
 
 def _reference_url_is_safe(url: str) -> bool:
     """True if a caller-supplied reference-image URL is safe to dispatch.
@@ -319,10 +326,12 @@ class VisualIdentityFeature(Feature):
 
     async def _generate_with_provider(
         self,
-        prompt: str,
+        resolved_prompt: ResolvedSelfiePrompt,
         lora_path: str,
-        trigger_word: str,
-        companion_id: str,
+        companion_id: Optional[str],
+        companion_did: Optional[str] = None,
+        avatar_reference_url: Optional[str] = None,
+        requested_by: Optional[str] = None,
         lora_ipfs_cid: Optional[str] = None,
         provider_name: Optional[str] = None,
         flux_version: Optional[str] = None,
@@ -334,10 +343,12 @@ class VisualIdentityFeature(Feature):
         (only supported by RunPod adapter currently).
 
         Args:
-            prompt: Generation prompt
+            resolved_prompt: Canonical final prompt and generation parameters
             lora_path: Path to LoRA model (GCS path or local)
-            trigger_word: LoRA trigger word
-            companion_id: Companion ID for logging
+            companion_id: Authenticated companion ID for provider attribution
+            companion_did: Server-resolved companion DID, when available
+            avatar_reference_url: Server-owned avatar reference, when available
+            requested_by: Authenticated requesting user, when available
             lora_ipfs_cid: Optional IPFS CID for LoRA (preferred over lora_path)
             provider_name: Optional specific provider to use ("runpod", "vertex_ai", etc.)
             flux_version: Optional FLUX version ("flux1" or "flux2") for container selection
@@ -360,10 +371,38 @@ class VisualIdentityFeature(Feature):
             )
 
         try:
-            config = GenerationConfig(
-                prompt=prompt,
+            # This helper is the one construction path for both reference-image
+            # and trained-LoRA requests. Besides preserving compatibility with
+            # SDKs that predate the context fields, it prevents the LoRA path
+            # from silently dropping the authenticated companion/user context
+            # a catalog provider needs to bind the promoted active model.
+            config = self._build_generation_config(
+                prompt=resolved_prompt.prompt,
                 lora_path=lora_path,
-                trigger_word=trigger_word,
+                # Must be the SAME token the resolved prompt binds.  A stored
+                # trigger can be uncanonical ('TOKMaria J ' with a trailing
+                # space), and resolve_selfie_prompt canonicalizes it.  Sending
+                # the raw form alongside a normalized prompt makes the worker's
+                # `if trigger_word not in prompt` guard re-prepend the trigger,
+                # binding it twice — the exact invariant this type enforces.
+                trigger_word=resolved_prompt.trigger_word,
+                num_outputs=resolved_prompt.num_outputs,
+                width=resolved_prompt.width,
+                height=resolved_prompt.height,
+                num_inference_steps=resolved_prompt.num_inference_steps,
+                guidance_scale=float(resolved_prompt.guidance_scale),
+                seed=resolved_prompt.seed,
+                companion_id=companion_id,
+                companion_did=companion_did,
+                # resolve_selfie_prompt no longer swaps the scene, so this is
+                # the caller's own normalized value — the same one the prompt
+                # and spec digest describe.
+                scene=resolved_prompt.scene,
+                style=resolved_prompt.style,
+                resolved_prompt_sha256=resolved_prompt.prompt_sha256,
+                avatar_reference_url=avatar_reference_url,
+                requested_by=requested_by,
+                flux_version=flux_version,
             )
 
             # Log which LoRA source we're using
@@ -376,8 +415,32 @@ class VisualIdentityFeature(Feature):
             # Pass flux_version to select correct container (flux1 = uncensored, flux2 = standard)
             result = await training_provider.generate_image(config, lora_ipfs_cid=lora_ipfs_cid, flux_version=flux_version)
 
-            if result.state.value != "completed":
-                raise RuntimeError(f"Generation failed: {result.error or 'Unknown error'}")
+            state = getattr(result, "state", None)
+            state_value = getattr(state, "value", None)
+            job_id = getattr(result, "job_id", None)
+
+            if state_value == "failed":
+                raise RuntimeError(
+                    f"Generation failed: {result.error or 'Unknown error'}"
+                )
+
+            # A catalog provider accepts the authenticated LoRA request and
+            # renders it out-of-band. Queue acceptance is a usable result when
+            # it has a durable handle, just as it is on the reference path.
+            if state_value != "completed":
+                if not job_id:
+                    raise RuntimeError(
+                        "Generation did not complete and returned no job handle"
+                    )
+                return {
+                    "success": True,
+                    "images": [],
+                    "queued": True,
+                    "job_id": job_id,
+                    "status": state_value,
+                    "backend": training_provider.provider_name,
+                    "elapsed_seconds": getattr(result, "elapsed_seconds", None),
+                }
 
             if not result.images:
                 raise RuntimeError("Generation completed but no images returned")
@@ -387,6 +450,9 @@ class VisualIdentityFeature(Feature):
             return {
                 "success": True,
                 "images": result.images,
+                "queued": False,
+                "job_id": job_id,
+                "status": state_value,
                 "backend": training_provider.provider_name,
                 "elapsed_seconds": result.elapsed_seconds,
             }
@@ -483,12 +549,20 @@ class VisualIdentityFeature(Feature):
         lora_path: Optional[str] = None,
         trigger_word: str = "TOK",
         num_outputs: int = 1,
+        width: int = 1024,
+        height: int = 1024,
+        num_inference_steps: int = 28,
+        guidance_scale: float = 4.0,
+        seed: int = 0,
         companion_id: Optional[str] = None,
         companion_did: Optional[str] = None,
         scene: Optional[str] = None,
+        style: Optional[str] = None,
+        resolved_prompt_sha256: Optional[str] = None,
         avatar_reference_url: Optional[str] = None,
         requested_by: Optional[str] = None,
         engine_hint: Optional[str] = None,
+        flux_version: Optional[str] = None,
     ) -> "GenerationConfig":
         """Build a ``GenerationConfig`` carrying companion context.
 
@@ -502,9 +576,13 @@ class VisualIdentityFeature(Feature):
             "companion_id": companion_id,
             "companion_did": companion_did,
             "scene": scene,
+            "style": style,
+            "resolved_prompt_sha256": resolved_prompt_sha256,
             "avatar_reference_url": avatar_reference_url,
             "requested_by": requested_by,
             "engine_hint": engine_hint,
+            "flux_version": flux_version,
+            "seed": seed,
         }
         try:
             config = GenerationConfig(
@@ -512,6 +590,10 @@ class VisualIdentityFeature(Feature):
                 lora_path=lora_path,
                 trigger_word=trigger_word,
                 num_outputs=num_outputs,
+                width=width,
+                height=height,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
                 **{k: v for k, v in context.items() if v is not None},
             )
         except TypeError:
@@ -520,6 +602,10 @@ class VisualIdentityFeature(Feature):
                 lora_path=lora_path,
                 trigger_word=trigger_word,
                 num_outputs=num_outputs,
+                width=width,
+                height=height,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
             )
         # Older SDKs lack the companion-context fields entirely; make sure they
         # are present (defaulting to None) so downstream code can always read
@@ -752,36 +838,7 @@ Looking good! Want another one in a different style?"
 
     # Scene-specific prompt enhancements (shared across methods)
     # Each scene should include: setting, clothing/attire, pose, lighting
-    SCENE_PROMPTS = {
-        "portrait": "professional headshot, studio lighting, neutral background, business attire",
-        "casual": "casual selfie at home, comfortable clothes, natural lighting, relaxed smile",
-        "glamour": "glamorous evening setting, elegant black dress, sophisticated pose, studio lighting",
-        "flirty": "playful smile, flirtatious expression, slight head tilt, soft lighting",
-        "cozy": "cozy home setting, comfortable sweater, warm atmosphere, soft natural light",
-        "adventure": "outdoor hiking setting, athletic wear, dynamic pose, bright daylight",
-        "mysterious": "dramatic shadows, dark elegant attire, enigmatic expression, moody lighting",
-        "romantic": "soft romantic candlelit setting, elegant dress, intimate atmosphere, warm colors",
-        "playful": "fun playful expression, colorful casual outfit, bright colors, dynamic pose",
-        "dreamy": "dreamy soft focus, flowing white dress, ethereal lighting, pastel colors",
-        "confident": "confident powerful pose, professional attire, strong lighting, bold composition",
-        # Beach and swimwear scenes
-        "beach": "at the beach, bikini swimsuit, golden hour sunset lighting, ocean waves in background, beautiful smile, selfie angle",
-        "swimsuit": "poolside setting, stylish bikini, bright sunny day, relaxed pose, tropical vibes",
-        "tropical": "tropical beach paradise, colorful bikini, palm trees, crystal clear water, vacation selfie",
-        "pool": "luxury pool setting, designer swimwear, sunglasses, lounge chair, summer vibes",
-        # Additional lifestyle scenes
-        "fitness": "gym or yoga studio, athletic sports bra and leggings, energetic pose, natural lighting",
-        "nightout": "nightclub or bar setting, sexy cocktail dress, glamorous makeup, neon lights",
-        "lingerie": "elegant bedroom setting, tasteful lingerie, soft boudoir lighting, confident pose",
-        "summer": "sunny outdoor cafe, sundress, bright daylight, happy relaxed expression",
-        # Professional/occupational scenes
-        "nurse": "healthcare setting, nurse scrubs with stethoscope, hospital or clinic background, professional caring expression, soft clinical lighting",
-        # Adult scenes (for sovereign companions - requires uncensored model variant)
-        # Note: Base FLUX models have content filtering. For explicit content,
-        # use fine-tuned uncensored variants (e.g., FLUX.1-dev uncensored)
-        "topless": "artistic portrait, bare breasts visible, tasteful nude photography, studio lighting, sensual pose",
-        "nude": "full nude portrait, artistic nude photography, studio setting, tasteful pose, natural lighting",
-    }
+    SCENE_PROMPTS = SELFIE_SCENE_PROMPTS
 
     @tool(
         name="generate_selfie",
@@ -826,10 +883,10 @@ Looking good! Want another one in a different style?"
             provider: Force specific provider (runpod, vertex_ai, vastai). None = auto-select.
             requested_by: Authenticated user id to attribute the job to. Set by
                 REST callers (which have no agent.companion_context); propagated
-                into ``GenerationConfig.requested_by`` on the no-LoRA route so a
-                queue-based provider records the real user id instead of a
-                sentinel. When omitted, falls back to the agent context's
-                ``user_id`` on the chat path.
+                into ``GenerationConfig.requested_by`` on both the reference
+                and trained-LoRA routes so a queue-based provider records the
+                real user id instead of a sentinel. When omitted, falls back to
+                the agent context's ``user_id`` on the chat path.
 
         Returns:
             ``ToolResult.ok(confirmation, data={image_url, scene, used_lora,
@@ -843,11 +900,19 @@ Looking good! Want another one in a different style?"
                 "Image generation not available (no providers configured)"
             )
 
+        # Bind tenant identity once, before either generation route. Tool
+        # arguments are LLM-controlled; a bound agent's companion/user context
+        # is authoritative. The standalone server path has no bound context,
+        # so it may carry an explicitly authenticated ``requested_by`` value.
+        companion_context = None
+        if self.agent and hasattr(self.agent, "companion_context"):
+            raw_context = getattr(self.agent, "companion_context", None)
+            companion_context = raw_context if isinstance(raw_context, dict) else {}
+
         # AUTO-FILL companion_id from agent's companion_context if not provided
         # This enables "send me a selfie" to work without the user providing IDs
-        if not companion_id and self.agent and hasattr(self.agent, 'companion_context'):
-            companion_context = getattr(self.agent, 'companion_context', {})
-            companion_id = companion_context.get('companion_id')
+        if not companion_id and companion_context is not None:
+            companion_id = companion_context.get("companion_id")
             if companion_id:
                 logger.info(f"Auto-filled companion_id from agent context: {companion_id}")
 
@@ -860,9 +925,8 @@ Looking good! Want another one in a different style?"
         # authoritative for the multi-tenant chat path. Callers without
         # an agent context (batch jobs / admin scripts) are unaffected —
         # they're already trusted server-side callers by construction.
-        if companion_id and self.agent and hasattr(self.agent, "companion_context"):
-            ctx = getattr(self.agent, "companion_context", {}) or {}
-            bound_id = ctx.get("companion_id")
+        if companion_id and companion_context is not None:
+            bound_id = companion_context.get("companion_id")
             if bound_id and str(companion_id) != str(bound_id):
                 logger.warning(
                     "generate_selfie companion_id=%s does not match agent "
@@ -873,9 +937,30 @@ Looking good! Want another one in a different style?"
                     "companion_id does not match the active companion context",
                     data={"code": "companion_id_mismatch", "status_code": 403},
                 )
+            if bound_id:
+                # Keep the host-owned value, not the merely-equal tool value,
+                # as the identity sent through all subsequent lookups/config.
+                companion_id = bound_id
+
+        if companion_context is not None:
+            requested_by = companion_context.get("user_id") or None
+
+        # Resolve provider context only from server-owned companion state. The
+        # caller-supplied ``reference_image`` remains eligible solely for the
+        # explicitly guarded no-LoRA route; it can never replace the avatar
+        # reference carried with a trained-LoRA request.
+        companion_did = (
+            await self._lookup_companion_did(companion_id)
+            if companion_id
+            else None
+        )
+        server_avatar_reference_url = (
+            await self._lookup_avatar_url(companion_id)
+            if companion_id
+            else None
+        )
 
         scene = scene.lower()
-        scene_description = self.SCENE_PROMPTS.get(scene, self.SCENE_PROMPTS["casual"])
 
         # Look up companion appearance and trigger word if we have a companion_id and db_pool
         companion_appearance = ""
@@ -901,26 +986,34 @@ Looking good! Want another one in a different style?"
             except Exception as e:
                 logger.warning(f"Failed to lookup companion appearance: {e}")
 
-        # Build enhanced prompt - trigger word will be prepended later when we have it
-        # NOTE: The LoRA trigger word ALREADY encodes appearance (face, hair, body, clothing from training).
-        # We should NOT append companion_appearance as it's redundant and can conflict with scene requests.
-        # If custom_prompt provided, use it directly (for censorship testing, etc.)
+        # Resolve the placeholder form through the same pure function the
+        # accepted-quote product path uses with the promoted LoRA trigger.
+        #
+        # ``scene``, ``style``, and ``custom_prompt`` are model-supplied tool
+        # arguments, so an unsupported style or a prompt that binds the trigger
+        # twice is ordinary bad input, not an internal fault.  Convert it to
+        # this tool's declared failure envelope instead of letting a ValueError
+        # escape a `-> ToolResult` method and strip the caller's structured
+        # data.
+        try:
+            prompt_template = resolve_selfie_prompt(
+                scene=scene,
+                style=style,
+                custom_prompt=custom_prompt,
+                trigger_word="TRIGGER_WORD",
+            )
+        except (ValueError, TypeError) as e:
+            return ToolResult.failed(str(e), data={"companion_id": companion_id})
+        base_prompt = prompt_template.prompt
+        # One normalized scene everywhere: the resolver preserves the caller's
+        # value (it only declines to invent descriptive text for a scene it
+        # does not know), and downstream exact-match lookups in frinz key on
+        # this, so the untrimmed argument must not leak into the result.
+        scene = prompt_template.scene
         if custom_prompt:
-            # Replace TRIGGER_WORD placeholder if present, otherwise prepend it
-            if "TRIGGER_WORD" in custom_prompt:
-                base_prompt = custom_prompt
-            else:
-                base_prompt = f"TRIGGER_WORD, {custom_prompt}"
             logger.info(f"Using custom prompt: {custom_prompt[:80]}...")
         else:
-            # Use ONLY scene description - trigger word already has appearance baked in from LoRA training
-            base_prompt = f"A photo of TRIGGER_WORD, {scene_description}. High quality, photorealistic, 8k."
             logger.info(f"Using scene '{scene}' with trigger word only (no appearance override)")
-
-            if style == "anime":
-                base_prompt = f"anime style illustration, {base_prompt}"
-            elif style == "artistic":
-                base_prompt = f"artistic portrait painting style, {base_prompt}"
 
         trained_this_request = False
         used_lora = False
@@ -975,7 +1068,7 @@ Looking good! Want another one in a different style?"
                         # 169.254.169.254 metadata endpoints via the
                         # unvalidated `reference_image` sink.
                         avatar_reference_url := (
-                            await self._lookup_avatar_url(companion_id)
+                            server_avatar_reference_url
                             or (
                                 reference_image
                                 if _reference_url_is_safe(reference_image)
@@ -994,31 +1087,27 @@ Looking good! Want another one in a different style?"
                         # no identity anchor the PuLID worker has nothing to
                         # reference, so we fall through to training/fail instead
                         # of enqueuing an unrouteable job.
-                        reference_prompt = (
-                            base_prompt.replace("A photo of TRIGGER_WORD, ", "A photo of ")
-                            .replace("TRIGGER_WORD, ", "")
-                            .replace("TRIGGER_WORD", "")
-                            .strip()
-                        )
-                        companion_did = await self._lookup_companion_did(companion_id)
-                        # Tenant-scoping precedence (codex round-2 P1 on #12):
-                        # `generate_selfie` is an @tool, so every kwarg is
-                        # LLM-controllable via prompt injection. If we let a
-                        # caller-supplied `requested_by` win when an agent
-                        # context is bound, a prompt-injected chat message
-                        # could attribute the queued job to another user's
-                        # ID and let that user's dashboard poll find it —
-                        # cross-tenant job leak. So: when self.agent has a
-                        # companion_context (chat path), we ALWAYS use its
-                        # user_id and IGNORE any tool-supplied
-                        # requested_by. Only the standalone REST path (no
-                        # agent context) honors the explicit param.
-                        if self.agent and hasattr(
-                            self.agent, "companion_context"
+                        # Derive the trigger-free prompt from the resolver's
+                        # own output rather than guessing its shape. When there
+                        # is no custom prompt AND this package has no
+                        # description for the scene, we have nothing useful to
+                        # say: send an empty override so the catalog worker's
+                        # own scene template wins instead of a subjectless
+                        # "A photo of ..." stub.
+                        # "Supplied" must mean the same thing it means to the
+                        # resolver: a blank custom prompt is *absent*, not a
+                        # prompt. Deciding it again with raw truthiness sent a
+                        # subjectless override for custom_prompt="   ".
+                        has_custom_prompt = bool(custom_prompt and custom_prompt.strip())
+                        if has_custom_prompt or SELFIE_SCENE_PROMPTS.get(
+                            prompt_template.scene
                         ):
-                            requested_by = getattr(
-                                self.agent, "companion_context", {}
-                            ).get("user_id") or None
+                            reference_prompt = prompt_without_trigger(prompt_template)
+                        else:
+                            # Nothing useful to say about this scene: send no
+                            # override so the catalog worker's own scene
+                            # template wins rather than a subjectless stub.
+                            reference_prompt = ""
                         return await self._generate_via_reference_image(
                             provider=reference_provider,
                             prompt=reference_prompt,
@@ -1060,10 +1149,15 @@ Looking good! Want another one in a different style?"
                         trigger_word = companion_trigger_word
                         logger.info(f"Using trigger word from avatar_config: {trigger_word}")
                     else:
-                        # Legacy fallback - generate trigger word from companion_id
+                        # Legacy fallback - generate trigger word from companion_id.
+                        # ``companion_id`` may be the host-owned bound object
+                        # rather than a str (a UUID, typically), so normalize
+                        # before slicing; indexing it directly raised TypeError
+                        # into the blanket handler below and lost the selfie.
                         trigger_word = "TOK"
-                        if companion_id and len(companion_id) >= 8:
-                            trigger_word = f"TOK{companion_id[:8].replace('-', '')}"
+                        companion_key = str(companion_id) if companion_id else ""
+                        if len(companion_key) >= 8:
+                            trigger_word = f"TOK{companion_key[:8].replace('-', '')}"
                         logger.warning(f"No trigger_word in DB, using generated: {trigger_word}")
 
                     # NEW: Try unified provider approach first (TrainingProviderFactory)
@@ -1071,37 +1165,75 @@ Looking good! Want another one in a different style?"
                     training_provider = self._get_training_provider(provider)
                     if training_provider and hasattr(training_provider, 'generate_image'):
                         try:
-                            # Replace TRIGGER_WORD placeholder with actual trigger word
-                            final_prompt = base_prompt.replace("TRIGGER_WORD", trigger_word)
+                            # Same conversion as the placeholder resolve above:
+                            # substituting the real trigger can newly double-bind
+                            # a custom prompt that passed the placeholder form,
+                            # and that is caller input, not an internal fault.
+                            try:
+                                resolved_prompt = resolve_selfie_prompt(
+                                    scene=scene,
+                                    style=style,
+                                    custom_prompt=custom_prompt,
+                                    trigger_word=trigger_word,
+                                )
+                            except (ValueError, TypeError) as e:
+                                return ToolResult.failed(
+                                    str(e), data={"companion_id": companion_id}
+                                )
+                            final_prompt = resolved_prompt.prompt
                             logger.info(f"Final prompt: {final_prompt[:100]}...")
 
                             result = await self._generate_with_provider(
-                                prompt=final_prompt,
+                                resolved_prompt=resolved_prompt,
                                 lora_path=lora_model_path,
-                                trigger_word=trigger_word,
-                                companion_id=companion_id or "unknown",
+                                companion_id=companion_id,
+                                companion_did=companion_did,
+                                avatar_reference_url=server_avatar_reference_url,
+                                requested_by=requested_by,
                                 lora_ipfs_cid=lora_ipfs_cid,  # Pass IPFS CID (preferred)
                                 provider_name=provider,  # Pass explicit provider selection
                                 flux_version=flux_version,  # "flux1" or "flux2" for container selection
                             )
-                            if result.get("success") and result.get("images"):
-                                return ToolResult.ok(
-                                    confirmation=(
-                                        f"Generated selfie (scene: {scene}, "
-                                        f"trained_this_request: {trained_this_request})"
-                                    ),
-                                    data={
-                                        "image_url": result["images"][0],
-                                        "scene": scene,
-                                        "prompt": final_prompt,  # for gallery storage
-                                        "used_lora": True,
-                                        "trained_this_request": trained_this_request,
-                                        "reference_used": False,
-                                        "backend": result.get("backend", "provider"),
-                                        "elapsed_seconds": result.get("elapsed_seconds"),
-                                        "lora_source": "ipfs" if lora_ipfs_cid else "gcs",
-                                    },
-                                )
+                            if result.get("success"):
+                                lora_result = {
+                                    "scene": scene,
+                                    "prompt": final_prompt,
+                                    # This marker is emitted only after the
+                                    # provider accepted the canonical config
+                                    # carrying this companion's LoRA context.
+                                    "used_lora": True,
+                                    "trained_this_request": trained_this_request,
+                                    "reference_used": False,
+                                    "backend": result.get("backend", "provider"),
+                                    "elapsed_seconds": result.get("elapsed_seconds"),
+                                    "lora_source": "ipfs" if lora_ipfs_cid else "gcs",
+                                }
+                                if result.get("images"):
+                                    return ToolResult.ok(
+                                        confirmation=(
+                                            f"Generated selfie (scene: {scene}, "
+                                            f"trained_this_request: "
+                                            f"{trained_this_request})"
+                                        ),
+                                        data={
+                                            **lora_result,
+                                            "image_url": result["images"][0],
+                                        },
+                                    )
+                                if result.get("queued"):
+                                    return ToolResult.ok(
+                                        confirmation=(
+                                            f"Queued selfie (scene: {scene}, "
+                                            "trained LoRA identity)"
+                                        ),
+                                        data={
+                                            **lora_result,
+                                            "queued": True,
+                                            "job_id": result.get("job_id"),
+                                            "status": result.get("status"),
+                                            "companion_id": companion_id,
+                                        },
+                                    )
                         except RuntimeError as e:
                             logger.error(f"Provider generation failed: {e}")
                             return ToolResult.failed(
@@ -1181,7 +1313,7 @@ Looking good! Want another one in a different style?"
         # Import TrainingConfig
         from kestrel_sovereign.features.training import TrainingConfig
 
-        trigger_word = f"TOK{companion_id[:8]}"
+        trigger_word = f"TOK{str(companion_id)[:8]}"
         config = TrainingConfig(trigger_word=trigger_word)
 
         try:

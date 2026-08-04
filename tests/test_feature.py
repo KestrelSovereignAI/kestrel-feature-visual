@@ -1,11 +1,11 @@
 """Tests for VisualIdentityFeature (extracted package)."""
 
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
+
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
-
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
-
 
 # =============================================================================
 # Fixtures
@@ -180,6 +180,37 @@ class TestGenerateSelfie:
         assert ("not available" in result.error.lower()
                 or "replicate" in result.error.lower())
 
+    @pytest.mark.parametrize(
+        "kwargs, expected",
+        [
+            (
+                {"custom_prompt": "TRIGGER_WORD next to TRIGGER_WORD"},
+                "bind the trigger once",
+            ),
+            ({"scene": "x" * 200}, "scene is invalid"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_invalid_prompt_arguments_fail_inside_the_tool_contract(
+        self, feature_standalone, kwargs, expected
+    ):
+        """Bad model-supplied arguments must not escape as raw exceptions.
+
+        ``style`` is advertised to the model as free-form text, so a
+        hallucinated value like "cinematic" is ordinary bad input. Raising out
+        of a ``-> ToolResult`` method strips the caller's structured envelope
+        and reaches the orchestrator as an unstructured failure.
+        """
+        # Past the availability guard so the prompt actually gets resolved.
+        feature_standalone.enabled = True
+
+        kwargs.setdefault("scene", "casual")
+        result = await feature_standalone.generate_selfie(**kwargs)
+
+        assert isinstance(result, ToolResult)
+        assert result.status is ToolResultStatus.ERROR
+        assert expected in result.error
+
 
 # =============================================================================
 # GenerationConfig companion-context helper
@@ -197,6 +228,8 @@ class TestBuildGenerationConfig:
             companion_id="comp-123",
             companion_did="did:key:abc",
             scene="beach",
+            style="anime",
+            resolved_prompt_sha256="a" * 64,
             avatar_reference_url="https://avatar.example/a.png",
             requested_by="user-9",
             engine_hint="pulid-avatar",
@@ -206,6 +239,8 @@ class TestBuildGenerationConfig:
         assert config.companion_id == "comp-123"
         assert config.companion_did == "did:key:abc"
         assert config.scene == "beach"
+        assert config.style == "anime"
+        assert config.resolved_prompt_sha256 == "a" * 64
         assert config.avatar_reference_url == "https://avatar.example/a.png"
         assert config.requested_by == "user-9"
         assert config.engine_hint == "pulid-avatar"
@@ -220,6 +255,8 @@ class TestBuildGenerationConfig:
         assert config.companion_id is None
         assert config.companion_did is None
         assert config.scene is None
+        assert config.style is None
+        assert config.resolved_prompt_sha256 is None
         assert config.avatar_reference_url is None
         assert config.requested_by is None
         assert config.engine_hint is None
@@ -269,6 +306,7 @@ class _QueueProvider:
         self.provider_name = provider_name
         self.capabilities = _Capabilities(True)
         self.received_config = None
+        self.received_kwargs = None
         self.generate_calls = 0
 
     async def generate_image(self, config, **kwargs):
@@ -278,6 +316,7 @@ class _QueueProvider:
         )
 
         self.received_config = config
+        self.received_kwargs = kwargs
         self.generate_calls += 1
         # Enqueue accepted: no image yet, only a job handle to poll.
         return GenerationResult(
@@ -321,6 +360,227 @@ class _FakePool:
 
     def acquire(self):
         return _FakeAcquire(self._conn)
+
+
+class _FailedProvider:
+    """Provider double that records its config and rejects generation."""
+
+    provider_name = "catalog_worker"
+    capabilities = _Capabilities(True)
+
+    def __init__(self):
+        self.received_config = None
+
+    async def generate_image(self, config, **kwargs):
+        from kestrel_sovereign.features.training import (
+            GenerationResult,
+            GenerationState,
+        )
+
+        self.received_config = config
+        return GenerationResult(
+            job_id="queue-job-rejected",
+            state=GenerationState.FAILED,
+            images=[],
+            error="catalog rejected LoRA binding",
+        )
+
+
+class TestTrainedLoraContext:
+    """Authenticated context carried through the trained-LoRA route (#18)."""
+
+    @staticmethod
+    def _promoted_row():
+        return {
+            "image_url": "https://stored.example/avatar.png",
+            "did": "did:key:companion-123",
+            "avatar_config": {
+                "url": "https://older.example/avatar.png",
+                "lora_model_path": (
+                    "catalog://companions/comp-123/lora/sha256:promoted"
+                ),
+                "lora_ipfs_cid": "bafy-promoted-lora",
+                "trigger_word": "TOKPROMOTED",
+                "flux_version": "flux1",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_queue_receives_complete_trained_lora_context(
+        self, feature_standalone
+    ):
+        """The promoted-LoRA path uses the canonical config builder and a
+        queue acceptance remains an honest queued success with LoRA context."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._promoted_row())
+
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="beach",
+            reference_image="https://caller.example/untrusted-avatar.png",
+            companion_id="comp-123",
+            allow_training=False,
+            requested_by="user-9",
+        )
+
+        assert result.status is ToolResultStatus.OK
+        assert provider.generate_calls == 1
+        config = provider.received_config
+        assert config.prompt.startswith("A photo of TOKPROMOTED")
+        assert config.lora_path == (
+            "catalog://companions/comp-123/lora/sha256:promoted"
+        )
+        assert config.trigger_word == "TOKPROMOTED"
+        assert config.companion_id == "comp-123"
+        assert config.companion_did == "did:key:companion-123"
+        assert config.scene == "beach"
+        # The trained path carries only the server-owned avatar reference;
+        # caller input cannot replace it.
+        assert config.avatar_reference_url == "https://stored.example/avatar.png"
+        assert config.requested_by == "user-9"
+        assert provider.received_kwargs == {
+            "lora_ipfs_cid": "bafy-promoted-lora",
+            "flux_version": "flux1",
+        }
+
+        assert result.data["queued"] is True
+        assert result.data["job_id"] == "queue-job-42"
+        assert result.data["status"] == "pending"
+        assert result.data["companion_id"] == "comp-123"
+        assert result.data["used_lora"] is True
+        assert result.data["reference_used"] is False
+        assert "image_url" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_bound_agent_identity_wins_on_trained_lora_path(
+        self, feature_standalone
+    ):
+        """A prompt-injected owner cannot override the bound agent user, and
+        an equal tool companion is normalized to the host-owned identity."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._promoted_row())
+        bound_companion_id = UUID("00000000-0000-0000-0000-000000000123")
+
+        class _Agent:
+            def __init__(self):
+                self.companion_context = {
+                    "companion_id": bound_companion_id,
+                    "user_id": "bound-user-7",
+                }
+
+        feature.agent = _Agent()
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="cozy",
+            # Same identity, but from the tool boundary as a string. The
+            # authoritative host-owned UUID must be carried to the provider.
+            companion_id=str(bound_companion_id),
+            allow_training=False,
+            requested_by="attacker-supplied-user",
+        )
+
+        assert result.status is ToolResultStatus.OK
+        assert provider.received_config.companion_id is bound_companion_id
+        assert provider.received_config.requested_by == "bound-user-7"
+        assert provider.received_config.scene == "cozy"
+        assert result.data["used_lora"] is True
+
+    @pytest.mark.asyncio
+    async def test_standalone_requested_by_is_preserved_for_trained_lora(
+        self, feature_standalone
+    ):
+        """The trusted non-agent caller remains able to attribute the job."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._promoted_row())
+
+        provider = _FakeProvider("catalog_worker", supports_reference_image=True)
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="portrait",
+            companion_id="comp-123",
+            allow_training=False,
+            requested_by="authenticated-rest-user",
+        )
+
+        assert result.status is ToolResultStatus.OK
+        assert provider.received_config.requested_by == "authenticated-rest-user"
+        assert provider.received_config.companion_id == "comp-123"
+        assert result.data["used_lora"] is True
+
+    @pytest.mark.asyncio
+    async def test_rejected_trained_lora_request_never_claims_lora_use(
+        self, feature_standalone
+    ):
+        """A provider failure after receiving context is still a failure and
+        cannot emit the post-LoRA ``used_lora=true`` success marker."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._promoted_row())
+
+        provider = _FailedProvider()
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="beach",
+            companion_id="comp-123",
+            allow_training=False,
+            requested_by="user-9",
+        )
+
+        assert provider.received_config.companion_id == "comp-123"
+        assert provider.received_config.lora_path.endswith("sha256:promoted")
+        assert result.status is ToolResultStatus.ERROR
+        assert "catalog rejected LoRA binding" in result.error
+        assert not result.data or "used_lora" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_bound_companion_mismatch_stops_before_context_lookup(
+        self, feature_standalone
+    ):
+        """A tool-supplied companion cannot redirect a bound LoRA request."""
+        feature = feature_standalone
+        feature.enabled = True
+
+        class _Agent:
+            def __init__(self):
+                self.companion_context = {
+                    "companion_id": "bound-companion",
+                    "user_id": "bound-user",
+                }
+
+        feature.agent = _Agent()
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+
+        async def _lookup_must_not_run(*_args, **_kwargs):
+            raise AssertionError("tenant guard allowed a server-side lookup")
+
+        feature._lookup_companion_did = _lookup_must_not_run
+        feature._lookup_avatar_url = _lookup_must_not_run
+
+        result = await feature.generate_selfie(
+            scene="casual",
+            companion_id="different-companion",
+            lora_model_path="catalog://attacker/lora",
+            requested_by="different-user",
+            allow_training=False,
+        )
+
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["code"] == "companion_id_mismatch"
+        assert provider.generate_calls == 0
 
 
 class TestNoLoraReferenceRoute:
@@ -719,3 +979,359 @@ class TestTrainLora:
         assert isinstance(result, ToolResult)
         assert result.status is ToolResultStatus.ERROR
         assert "companion_id" in result.error.lower()
+
+
+class TestSceneAndIdentityPassthrough:
+    """Regressions for cross-repo scene routing and non-str bound ids (#18)."""
+
+    @staticmethod
+    def _promoted_row(**overrides):
+        row = {
+            "image_url": "https://stored.example/avatar.png",
+            "did": "did:key:companion-123",
+            "avatar_config": {
+                "url": "https://older.example/avatar.png",
+                "lora_model_path": (
+                    "catalog://companions/comp-123/lora/sha256:promoted"
+                ),
+                "lora_ipfs_cid": "bafy-promoted-lora",
+                "trigger_word": "TOKPROMOTED",
+                "flux_version": "flux1",
+            },
+        }
+        row["avatar_config"].update(overrides)
+        return row
+
+    @pytest.mark.parametrize("scene", ["shower", "bedroom", "spread_eagle"])
+    @pytest.mark.asyncio
+    async def test_scene_outside_this_map_is_passed_through_not_coerced(
+        self, feature_standalone, scene
+    ):
+        """A scene this package does not know must survive to the consumer.
+
+        SELFIE_SCENE_PROMPTS is a deliberate subset of the vocabulary frinz
+        uses: these three are tier-gated paid sovereign scenes that route to a
+        different render engine, key the (companion_did, scene) enqueue
+        coalescing, and name the stored asset. Reporting the coerced "casual"
+        would misroute the request, collapse two distinct paid jobs into one,
+        and file the result under the wrong scene.
+        """
+        from kestrel_feature_visual.selfie_spec import SELFIE_SCENE_PROMPTS
+
+        assert scene not in SELFIE_SCENE_PROMPTS
+
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._promoted_row())
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene=scene, companion_id="comp-123", allow_training=False
+        )
+
+        assert result.status is ToolResultStatus.OK
+        assert provider.received_config.scene == scene
+        assert result.data["scene"] == scene
+
+    @pytest.mark.asyncio
+    async def test_non_str_bound_companion_id_survives_legacy_trigger_fallback(
+        self, feature_standalone
+    ):
+        """A bound UUID id must not crash the no-trigger_word legacy row path.
+
+        The host-owned companion identity replaces the caller's string, so the
+        legacy fallback that derives a trigger from the id receives a UUID.
+        Slicing it directly raised TypeError into the blanket handler and lost
+        the selfie entirely.
+        """
+        bound_companion_id = UUID("00000000-0000-0000-0000-000000000123")
+        legacy_row = self._promoted_row()
+        del legacy_row["avatar_config"]["trigger_word"]
+
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(legacy_row)
+        class _Agent:
+            def __init__(self):
+                self.companion_context = {"companion_id": bound_companion_id}
+
+        feature.agent = _Agent()
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="casual",
+            companion_id=str(bound_companion_id),
+            allow_training=False,
+        )
+
+        assert result.status is ToolResultStatus.OK, result.error
+        assert provider.received_config.trigger_word == "TOK00000000"
+
+
+class TestDispatchedTriggerBinding:
+    """The exactly-once invariant must hold at the config a provider gets."""
+
+    @staticmethod
+    def _row(trigger_word):
+        return {
+            "image_url": "https://stored.example/avatar.png",
+            "did": "did:key:companion-123",
+            "avatar_config": {
+                "lora_model_path": "catalog://c/lora/sha256:promoted",
+                "lora_ipfs_cid": "bafy-promoted-lora",
+                "trigger_word": trigger_word,
+                "flux_version": "flux1",
+            },
+        }
+
+    @pytest.mark.parametrize(
+        "stored_trigger",
+        [
+            "TOKPROMOTED",     # already canonical
+            "TOKMaria J ",     # trailing space  (name "Maria J Lopez")
+            "TOKLi  Wei",      # doubled space   (name "Li  Wei")
+            "TOKMary\tJan",    # embedded tab    (name "Mary\tJane")
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_config_trigger_is_the_one_the_prompt_binds(
+        self, feature_standalone, stored_trigger
+    ):
+        """``config.trigger_word`` must be the token ``config.prompt`` contains.
+
+        The worker prepends the trigger when ``trigger_word not in prompt``
+        (simpletuner_api inference route). Sending the raw stored value beside
+        a canonicalized prompt makes that guard fire and bind the trigger a
+        second time — silently, on paid renders, for exactly the companions
+        canonicalization was added to support.
+        """
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._row(stored_trigger))
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="casual", companion_id="comp-123", allow_training=False
+        )
+
+        assert result.status is ToolResultStatus.OK, result.error
+        config = provider.received_config
+        # The worker's guard must not fire...
+        assert config.trigger_word in config.prompt
+        # ...and the token must appear exactly once.
+        assert config.prompt.count(config.trigger_word) == 1
+
+
+    @pytest.mark.asyncio
+    async def test_custom_prompt_double_binding_the_real_trigger_fails_in_contract(
+        self, feature_standalone
+    ):
+        """A prompt valid in placeholder form can double-bind the real trigger.
+
+        ``TRIGGER_WORD and TOKPROMOTED`` passes the placeholder resolve and only
+        collides once the promoted trigger is substituted. That is caller input,
+        so it must return the tool's failure envelope rather than reach the
+        blanket handler with no structured data.
+        """
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._row("TOKPROMOTED"))
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="casual",
+            companion_id="comp-123",
+            custom_prompt="TRIGGER_WORD and TOKPROMOTED",
+            allow_training=False,
+        )
+
+        assert result.status is ToolResultStatus.ERROR
+        assert "bind the trigger once" in result.error
+        assert result.data == {"companion_id": "comp-123"}
+        assert provider.generate_calls == 0
+
+
+class TestCallerOwnedDescriptors:
+    """scene/style come from frinz unvalidated; this package must not gate them."""
+
+    @staticmethod
+    def _row():
+        return {
+            "image_url": "https://stored.example/avatar.png",
+            "did": "did:key:companion-123",
+            "avatar_config": {
+                "lora_model_path": "catalog://c/lora/sha256:promoted",
+                "trigger_word": "TOKPROMOTED",
+            },
+        }
+
+    @pytest.mark.parametrize(
+        "scene, style",
+        [
+            ("rooftop bar at sunset", "photorealistic"),  # frinz prose scene
+            ("stargazing at night with aurora borealis", "cinematic"),
+            ("Café", "realistic"),
+            ("shower", "anime"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_free_form_scene_and_style_still_produce_a_selfie(
+        self, feature_standalone, scene, style
+    ):
+        """frinz forwards both unvalidated and supports prose scenes by design.
+
+        scene_keywords.selfie_scene_upgrade_detail records that fail-closed
+        handling wrongly 403'd "stargazing at night with aurora borealis", and
+        both endpoints declare scene/style as unconstrained str. Rejecting
+        them here turns a working paid request into an error.
+        """
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._row())
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene=scene, style=style, companion_id="comp-123", allow_training=False
+        )
+
+        assert result.status is ToolResultStatus.OK, result.error
+        assert provider.received_config.scene == " ".join(scene.split()).lower()
+        assert provider.received_config.style == style.lower()
+
+    @pytest.mark.asyncio
+    async def test_scene_is_normalized_before_it_leaves_the_feature(
+        self, feature_standalone
+    ):
+        """frinz keys routing, job coalescing and asset names on exact match."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = _FakePool(self._row())
+        provider = _QueueProvider("catalog_worker")
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        result = await feature.generate_selfie(
+            scene="  BeAcH  ", companion_id="comp-123", allow_training=False
+        )
+
+        assert result.status is ToolResultStatus.OK, result.error
+        assert provider.received_config.scene == "beach"
+        assert result.data["scene"] == "beach"
+
+
+class TestReferenceRoutePromptShape:
+    """The no-LoRA route must never emit a subjectless prompt (#18 review 6)."""
+
+    @staticmethod
+    async def _run(feature, scene, custom_prompt=None):
+        feature.enabled = True
+        feature.db_pool = None
+        provider = _FakeProvider("catalog_worker", supports_reference_image=True)
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        async def _fake_lookup(_cid):
+            return "https://avatar.example/a.png"
+
+        feature._lookup_avatar_url = _fake_lookup
+        result = await feature.generate_selfie(
+            scene=scene,
+            companion_id="comp-123",
+            custom_prompt=custom_prompt,
+            allow_training=False,
+        )
+        return result, provider.received_config
+
+    @pytest.mark.parametrize("scene", ["shower", "bedroom", "spread_eagle"])
+    @pytest.mark.asyncio
+    async def test_unknown_scene_sends_no_override_so_the_worker_template_wins(
+        self, feature_standalone, scene
+    ):
+        """This package has no description for a sovereign scene.
+
+        Emitting "A photo of . High quality..." would drive a paid render with
+        no subject and no scene, and the catalog worker honours
+        prompt_override unconditionally, so its own scene template would never
+        be consulted. Sending nothing lets that template win.
+        """
+        from kestrel_feature_visual.selfie_spec import SELFIE_SCENE_PROMPTS
+
+        assert scene not in SELFIE_SCENE_PROMPTS
+        result, config = await self._run(feature_standalone, scene)
+
+        assert result.status is ToolResultStatus.OK, result.error
+        assert config.scene == scene
+        assert not config.prompt
+        assert "A photo of ." not in (config.prompt or "")
+
+    @pytest.mark.asyncio
+    async def test_known_scene_still_sends_a_coherent_trigger_free_prompt(
+        self, feature_standalone
+    ):
+        from kestrel_feature_visual.selfie_spec import SELFIE_SCENE_PROMPTS
+
+        result, config = await self._run(feature_standalone, "beach")
+
+        assert result.status is ToolResultStatus.OK, result.error
+        assert SELFIE_SCENE_PROMPTS["beach"] in config.prompt
+        assert "TRIGGER_WORD" not in config.prompt
+        assert "A photo of ." not in config.prompt
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t "])
+    @pytest.mark.asyncio
+    async def test_blank_custom_prompt_is_absent_on_the_reference_route_too(
+        self, feature_standalone, blank
+    ):
+        """The route must not re-decide "supplied" differently from the resolver.
+
+        resolve_selfie_prompt treats a blank custom prompt as absent, so
+        deciding it again with raw truthiness sent a subjectless override for
+        an unknown scene — the catalog worker honours prompt_override
+        unconditionally, so its scene template never ran.
+        """
+        result, config = await self._run(
+            feature_standalone, "shower", custom_prompt=blank
+        )
+
+        assert result.status is ToolResultStatus.OK, result.error
+        assert not config.prompt
+        assert "A photo of ." not in (config.prompt or "")
+
+    @pytest.mark.parametrize(
+        "style, marker",
+        [("anime", "anime style illustration"), ("artistic", "artistic portrait")],
+    )
+    @pytest.mark.asyncio
+    async def test_reference_route_keeps_the_style_prefix(
+        self, feature_standalone, style, marker
+    ):
+        """origin/main applied the style prefix here; rebuilding the prompt by
+        hand silently dropped it while the gallery row still recorded the
+        requested style."""
+        feature = feature_standalone
+        feature.enabled = True
+        feature.db_pool = None
+        provider = _FakeProvider("catalog_worker", supports_reference_image=True)
+        feature._get_training_provider = lambda *a, **k: provider
+        feature._ensure_lora_services = lambda: False
+
+        async def _fake_lookup(_cid):
+            return "https://avatar.example/a.png"
+
+        feature._lookup_avatar_url = _fake_lookup
+        result = await feature.generate_selfie(
+            scene="beach", style=style, companion_id="comp-123", allow_training=False
+        )
+
+        assert result.status is ToolResultStatus.OK, result.error
+        assert provider.received_config.prompt.startswith(marker)
